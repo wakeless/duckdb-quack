@@ -37,10 +37,22 @@ insert into remote_site.memberships_base values
     (2, 'org_b', 201, 'member', 'false');
 
 statement ok quack_db:quack_server_con
+create table remote_site.teams_base(id int, project_id int, org varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.teams_base values
+    (1, 1, 'org_a'),
+    (2, 1, 'org_a'),
+    (3, 2, 'org_b');
+
+statement ok quack_db:quack_server_con
 create view remote_site.projects as from remote_site.projects_base;
 
 statement ok quack_db:quack_server_con
 create view remote_site.memberships as from remote_site.memberships_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.teams as from remote_site.teams_base;
 
 # ---------------------------------------------------------------------------
 # Client side: same-shaped local tables, then union views that tag each leg
@@ -127,12 +139,11 @@ b	1	2024-02-01
 
 # ---------------------------------------------------------------------------
 # Two union views in one query: each remote leg is a separate by-name scan on
-# the same connection, which is not yet supported. The statement-level remote
-# pushdown cannot collapse these queries because each view also has a local
-# leg.
-# TODO once multiple scans on one connection are supported, this should return
-#   a 1 2 / a 2 1 / a 3 NULL / b 1 2 / b 2 1 / b 3 NULL / b 4 NULL
-statement error con2
+# the same connection. The statement-level remote pushdown cannot collapse
+# these queries because each view also has a local leg.
+# ---------------------------------------------------------------------------
+
+query III con2
 select p.site, p.id, mc.member_count
 from projects p
 left join (
@@ -143,17 +154,61 @@ left join (
 ) mc on mc.project_id = p.id and mc.org is not distinct from p.org and mc.site = p.site
 order by p.site, p.id;
 ----
-not currently supported
+a	1	2
+a	2	1
+a	3	NULL
+b	1	2
+b	2	1
+b	3	NULL
+b	4	NULL
 
-# Same limitation for a plain join between two union views.
-# TODO should return 10 (the site column in the join keys is load-bearing:
-# both legs share ids, so dropping the site condition would cross-match legs).
-statement error con2
+# The site column in the join keys is load-bearing: both legs share ids, so
+# dropping the site condition would cross-match legs.
+query I con2
 select count(*)
 from projects p
 join memberships m on m.project_id = p.id and m.site = p.site and m.org is not distinct from p.org;
 ----
-not currently supported
+10
+
+# ---------------------------------------------------------------------------
+# A reporting query over three union views: derived aggregates, JSON filter,
+# org exclusion, ORDER BY and LIMIT.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+create table local_site.teams(id int, project_id int, org varchar);
+
+statement ok con2
+insert into local_site.teams values
+    (1, 1, 'org_a'),
+    (2, 2, 'org_c');
+
+statement ok con2
+create view teams as (select 'a' as site, * from local_site.teams) union all (select 'b' as site, * from remote.remote_site.teams);
+
+query IIIII con2
+select p.site, p.id, p.name, mc.member_count, tc.team_count
+from projects p
+left join (
+    select project_id, org, site, count(*) as member_count
+    from memberships
+    where role = 'member' and (removed = 'false' or removed is null)
+    group by 1, 2, 3
+) mc on mc.project_id = p.id and mc.org is not distinct from p.org and mc.site = p.site
+left join (
+    select project_id, org, site, count(*) as team_count
+    from teams
+    group by 1, 2, 3
+) tc on tc.project_id = p.id and tc.org is not distinct from p.org and tc.site = p.site
+where json_extract_string(p.settings::JSON, '$."feature_enabled"') = 'true'
+  and (p.org <> 'internal' or p.org is null)
+order by p.org, p.deadline desc
+limit 10;
+----
+b	1	beta	2	2
+a	1	alpha	2	1
+b	4	orphan	NULL	NULL
 
 # ---------------------------------------------------------------------------
 # A union view whose legs are both LOCAL joins fine with a single

@@ -1,9 +1,12 @@
 #pragma once
 
+#include <map>
 #include <thread>
 
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 
 #include "quack_uri.hpp"
 
@@ -22,16 +25,35 @@ class EncryptionState;
 
 enum class QuackQueryState : uint8_t { IDLE, ACTIVE, FINISHED, CANCELLED };
 
+//! A result a client has PREPAREd but not yet fully fetched. At most one pending result per
+//! connection holds a `live` streaming result (the underlying DuckDB connection supports only
+//! one); when another query needs the connection, the live result is drained into `buffered`
+//! (a buffer-managed collection that can spill to disk) and served from there.
+struct QuackPendingResult {
+	//! Live streaming result (exclusive with `buffered`)
+	unique_ptr<QueryResult> live;
+	//! Result drained out of the way of a later query; remaining batches are served from here
+	unique_ptr<ColumnDataCollection> buffered;
+	ColumnDataScanState buffered_scan;
+	//! Error raised while draining `live`; reported on the next FETCH
+	ErrorData error;
+	//! Monotonic counter assigned per FETCH batch — enables order-preserving parallel scans
+	idx_t next_batch_index = 1;
+	//! Set once every row has been served; the prepare_count at exhaustion time (see cleanup)
+	optional_idx exhausted_at;
+};
+
 struct QuackConnection {
 	explicit QuackConnection(string session_id_p);
 	~QuackConnection();
 
 	mutex lock;
 	unique_ptr<Connection> duckdb_connection;
-	unique_ptr<QueryResult> duckdb_query_result;
-	//! Monotonic counter assigned per FETCH batch — enables order-preserving parallel scans on
-	idx_t next_batch_index = 1;
-	//! Current result UUID
+	//! Pending results keyed by result UUID
+	map<hugeint_t, QuackPendingResult> pending_results;
+	//! Number of PREPAREs handled on this connection (drives exhausted-result cleanup)
+	idx_t prepare_count = 0;
+	//! UUID of the most recent result (drives the query_state snapshot)
 	hugeint_t result_uuid;
 	string session_id;
 	string sql_query;
