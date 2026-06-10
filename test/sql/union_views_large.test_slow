@@ -1,0 +1,70 @@
+# name: test/sql/union_views_large.test_slow
+# description: union views whose remote leg needs multiple FETCH batches
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# Each remote leg holds 100k rows — well past one FETCH batch, so the by-name
+# scan behind the view must stream follow-up FETCH requests instead of
+# completing within the bind-time PREPARE response.
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.events_base as select range id, range % 97 as val from range(100000);
+
+statement ok quack_db:quack_server_con
+create table remote_site.metrics_base as select range id, range % 31 as m from range(100000);
+
+statement ok quack_db:quack_server_con
+create view remote_site.events as from remote_site.events_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.metrics as from remote_site.metrics_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.events as select range id, range % 97 as val from range(100000);
+
+statement ok con2
+create table local_site.metrics as select range id, range % 31 as m from range(100000);
+
+statement ok con2
+create view events as (select 'a' as site, * from local_site.events) union all (select 'b' as site, * from remote.remote_site.events);
+
+statement ok con2
+create view metrics as (select 'a' as site, * from local_site.metrics) union all (select 'b' as site, * from remote.remote_site.metrics);
+
+# A single union view streams its remote leg across many FETCH batches, with
+# the client-side projection applied to every batch.
+query II con2
+select site, count(*) from events group by 1 order by 1;
+----
+a	100000
+b	100000
+
+query I con2
+select sum(val) from events;
+----
+9599370
+
+# Two union views in one query need two by-name scans on one connection,
+# which is not yet supported (and cannot be collapsed by the statement-level
+# remote pushdown because each view also has a local leg).
+# TODO once multiple scans on one connection are supported, this should
+# stream both scans and return 200000.
+statement error con2
+select count(*) from events e join metrics m on e.id = m.id and e.site = m.site;
+----
+not currently supported
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
