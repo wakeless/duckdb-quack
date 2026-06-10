@@ -62,6 +62,33 @@ select count(*) from events e join metrics m on e.id = m.id and e.site = m.site;
 ----
 200000
 
+# ---------------------------------------------------------------------------
+# A pending result abandoned before it is drained tells the server to drop it
+# instead of leaving it buffered. EXPLAIN binds the by-name scan (which
+# PREPAREs the result) but never scans it, so teardown must close it.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call enable_logging('Quack');
+
+statement ok con2
+explain select * from remote.remote_site.events;
+
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CLOSE_RESULT_REQUEST';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# scans that end early (e.g. a LIMIT over the union view) still return correct
+# results; their abandoned results are closed the same way
+query I con2
+select count(*) from (select id from events limit 5) t;
+----
+5
+
 statement ok con2
 detach remote;
 

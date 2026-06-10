@@ -154,6 +154,19 @@ QuackClientConnection::~QuackClientConnection() {
 	}
 }
 
+void QuackClientConnection::CloseResult(hugeint_t result_uuid) const noexcept {
+	try {
+		lock_guard<mutex> guard(lock);
+		if (cached_clients.empty()) {
+			// no client to send with - the server drops the result on disconnect
+			return;
+		}
+		auto &client = cached_clients.back();
+		client->Request<SuccessResponse>(nullptr, make_uniq<CloseResultRequestMessage>(connection_id, result_uuid));
+	} catch (...) {
+	}
+}
+
 shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &context, const QuackUri &uri,
                                                                string token) {
 	// if no token is provided fetch it from the secret manager

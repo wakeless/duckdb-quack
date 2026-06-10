@@ -23,6 +23,16 @@ unique_ptr<AppendRequestMessage> AppendRequestMessage::Deserialize(Deserializer 
 	return result;
 }
 
+void CloseResultRequestMessage::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<hugeint_t>(1, "uuid", uuid);
+}
+
+unique_ptr<CloseResultRequestMessage> CloseResultRequestMessage::Deserialize(Deserializer &deserializer) {
+	auto result = duckdb::unique_ptr<CloseResultRequestMessage>(new CloseResultRequestMessage());
+	deserializer.ReadProperty<hugeint_t>(1, "uuid", result->uuid);
+	return result;
+}
+
 void ConnectionRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "auth_string", auth_string);
 	serializer.WritePropertyWithDefault<string>(2, "client_duckdb_version", client_duckdb_version);

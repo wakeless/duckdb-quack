@@ -6,6 +6,14 @@
 namespace duckdb {
 
 struct QuackScanBindData : FunctionData {
+	~QuackScanBindData() override {
+		if (owns_pending_result && client_connection) {
+			// the result PREPAREd at bind time was never scanned (e.g. EXPLAIN) - let the
+			// server drop it
+			client_connection->CloseResult(result_uuid);
+		}
+	}
+
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<QuackScanBindData>();
 		return other.client_connection->ConnectionId() == client_connection->ConnectionId() &&
@@ -30,6 +38,10 @@ struct QuackScanBindData : FunctionData {
 	optional_ptr<TableCatalogEntry> table_entry;
 	bool needs_more_fetch = true;
 	hugeint_t result_uuid;
+	//! Whether this bind data is responsible for the server-side result it PREPAREd at bind
+	//! time; responsibility moves to the scan's global state once scanning starts.
+	//! Deliberately not copied: a copy never owns the original's pending result.
+	bool owns_pending_result = false;
 };
 
 class TableFunction;

@@ -64,6 +64,10 @@ public:
 	unique_ptr<QuackClientWrapper> GetClient(ClientContext &context) const;
 	//! Return a client back to the cache
 	void StoreClient(unique_ptr<QuackClient> client_p) const;
+	//! Tell the server a pending result will not be fetched any further and can be dropped.
+	//! Best-effort and safe to call from destructors: never throws, and skips silently when
+	//! no cached client is available.
+	void CloseResult(hugeint_t result_uuid) const noexcept;
 
 private:
 	QuackUri uri;

@@ -56,6 +56,7 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	bind_data->results = std::move(bind_response->MutableResults());
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
+	bind_data->owns_pending_result = bind_data->needs_more_fetch;
 
 	return bind_data;
 }
@@ -115,6 +116,7 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	bind_data->results = std::move(bind_response->MutableResults());
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
+	bind_data->owns_pending_result = bind_data->needs_more_fetch;
 	return bind_data;
 }
 
@@ -157,10 +159,17 @@ struct QuackScanLocalState : public LocalTableFunctionState {
 
 struct QuackScanGlobalState : GlobalTableFunctionState {
 	explicit QuackScanGlobalState(vector<ColumnIndex> column_ids_p, vector<idx_t> projection_id_p,
-	                              vector<ChunkResult> results_p, bool needs_more_fetch_p, hugeint_t result_uuid_p)
+	                              vector<ChunkResult> results_p, bool needs_more_fetch_p, hugeint_t result_uuid_p,
+	                              shared_ptr<QuackClientConnection> client_connection_p)
 	    : max_threads(needs_more_fetch_p ? MAX_THREADS : 1), column_ids(std::move(column_ids_p)),
 	      projection_ids(std::move(projection_id_p)), needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid_p),
-	      results(std::move(results_p)) {
+	      client_connection(std::move(client_connection_p)), results(std::move(results_p)) {
+	}
+	~QuackScanGlobalState() override {
+		if (needs_more_fetch && client_connection) {
+			// the scan ended before draining the result (e.g. a LIMIT) - let the server drop it
+			client_connection->CloseResult(result_uuid);
+		}
 	}
 	idx_t MaxThreads() const override {
 		return max_threads;
@@ -170,6 +179,7 @@ struct QuackScanGlobalState : GlobalTableFunctionState {
 	vector<idx_t> projection_ids;
 	atomic<bool> needs_more_fetch;
 	hugeint_t result_uuid;
+	shared_ptr<QuackClientConnection> client_connection;
 
 	vector<ChunkResult> TryGetResults() {
 		lock_guard<mutex> guard(lock);
@@ -281,10 +291,13 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
 		}
 		result_uuid = bind_data.result_uuid;
+		// the scan takes over the bind-time result; its global state now closes it if the
+		// scan ends early
+		input.bind_data->CastNoConst<QuackScanBindData>().owns_pending_result = false;
 	}
 	// we only multithread if there is more to fetch
 	return make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
-	                                       needs_more_fetch, result_uuid);
+	                                       needs_more_fetch, result_uuid, bind_data.client_connection);
 }
 
 unique_ptr<LocalTableFunctionState> QuackScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,

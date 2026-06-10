@@ -57,6 +57,16 @@
     ]
   },
   {
+    "class": "CloseResultRequestMessage",
+    "members": [
+      {
+        "id": 1,
+        "name": "uuid",
+        "type": "hugeint_t"
+      }
+    ]
+  },
+  {
     "class": "SuccessResponse",
     "members": []
   },

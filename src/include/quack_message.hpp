@@ -18,6 +18,7 @@ enum class MessageType : uint8_t {
 	APPEND_REQUEST = 9,
 	SUCCESS_RESPONSE = 10,
 	DISCONNECT_MESSAGE = 11,
+	CLOSE_RESULT_REQUEST = 12,
 	ERROR_RESPONSE = 100
 };
 
@@ -268,6 +269,28 @@ protected:
 public:
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<FetchRequestMessage> Deserialize(Deserializer &deserializer);
+
+	hugeint_t uuid;
+};
+
+//! Tells the server a pending result will not be fetched any further and can be dropped
+//! (e.g. the client stopped scanning early because of a LIMIT). Best-effort: closing an
+//! unknown or already-dropped result succeeds.
+class CloseResultRequestMessage : public QuackMessage {
+public:
+	static constexpr MessageType TYPE = MessageType::CLOSE_RESULT_REQUEST;
+
+	explicit CloseResultRequestMessage(string connection_id_p, hugeint_t uuid)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), uuid(uuid) {
+	}
+
+protected:
+	CloseResultRequestMessage() : QuackMessage(TYPE) {
+	}
+
+public:
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<CloseResultRequestMessage> Deserialize(Deserializer &deserializer);
 
 	hugeint_t uuid;
 };

@@ -168,6 +168,7 @@ bool ServerSupportsMessage(MessageType type) {
 	case MessageType::CONNECTION_REQUEST:
 	case MessageType::PREPARE_REQUEST:
 	case MessageType::FETCH_REQUEST:
+	case MessageType::CLOSE_RESULT_REQUEST:
 	case MessageType::APPEND_REQUEST:
 	case MessageType::DISCONNECT_MESSAGE:
 		return true;
@@ -459,6 +460,15 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			connection.query_state = QuackQueryState::FINISHED;
 		}
 		return make_uniq<FetchResponseMessage>(std::move(results), optional_idx(assigned_batch_index));
+	}
+
+	case MessageType::CLOSE_RESULT_REQUEST: {
+		auto &close_request_message = received_message.Cast<CloseResultRequestMessage>();
+		auto &connection = *connection_p;
+		std::unique_lock<std::mutex> lock(connection.lock);
+		// idempotent: closing an unknown or already-dropped result succeeds
+		connection.pending_results.erase(close_request_message.uuid);
+		return make_uniq<SuccessResponse>();
 	}
 
 	case MessageType::APPEND_REQUEST: {
