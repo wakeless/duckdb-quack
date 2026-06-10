@@ -346,9 +346,14 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 				global_state.needs_more_fetch = false;
 				return;
 			}
+			// Catalog-path scans re-PREPARE with the projection applied server-side, so fetched
+			// chunks are final. By-name scans stream the raw relation; every fetched chunk still
+			// needs the client-side projection.
+			auto pushdown_type = bind_data.table_name.empty() ? ChunkResultPushdownType::REQUIRES_PUSHDOWN
+			                                                  : ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
 			// set up buffer for scan in next iteration
 			for (auto &chunk : fetch_response->MutableResults()) {
-				local_state.results.emplace(chunk->Chunk(), ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED);
+				local_state.results.emplace(chunk->Chunk(), pushdown_type);
 			}
 			local_state.current_batch_index = fetch_response->BatchIndex();
 			continue;
