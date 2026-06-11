@@ -2,6 +2,7 @@
 
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -41,7 +42,9 @@ static bool IsAllowedScalarFunction(const string &name) {
 bool IsDeparseSafe(const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
-		// the alias carries the (already quoted) remote column name; an unnamed reference
+	case ExpressionClass::BOUND_COLUMN_REF:
+		// the alias carries the remote column name (column refs are offered to
+		// pushdown_expression before being rewritten into references); an unnamed node
 		// would deparse to a positional "#N" that means nothing to the server
 		if (expr.GetAlias().empty()) {
 			return false;
@@ -117,6 +120,34 @@ static void RenderFilterExpression(unique_ptr<Expression> expr, vector<string> &
 	}
 	StripNonColumnAliases(*expr);
 	clauses.push_back(expr->ToString());
+}
+
+string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &column_ids,
+                           const vector<string> &column_names, const vector<LogicalType> &column_types) {
+	auto copy = expr.Copy();
+	// rewrite each column reference into a name-carrying node the server understands
+	bool resolved = true;
+	ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+	    copy, [&](BoundColumnRefExpression &col_ref, unique_ptr<Expression> &node) {
+		    auto proj_idx = col_ref.Binding().column_index;
+		    if (proj_idx >= column_ids.size()) {
+			    resolved = false;
+			    return;
+		    }
+		    auto &col_index = column_ids[proj_idx];
+		    if (col_index.IsVirtualColumn() || col_index.GetPrimaryIndex() >= column_names.size()) {
+			    resolved = false;
+			    return;
+		    }
+		    auto col_id = col_index.GetPrimaryIndex();
+		    node = make_uniq<BoundReferenceExpression>(Identifier(SQLIdentifier::ToString(column_names[col_id])),
+		                                               column_types[col_id], 0ULL);
+	    });
+	if (!resolved || !IsDeparseSafe(*copy)) {
+		return string();
+	}
+	StripNonColumnAliases(*copy);
+	return copy->ToString();
 }
 
 string BuildFilterWhereClause(const TableFilterSet &filters, const vector<ColumnIndex> &column_indexes,

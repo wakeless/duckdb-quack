@@ -21,4 +21,10 @@ string BuildFilterWhereClause(const TableFilterSet &filters, const vector<Column
 //! casts and an allowlist of scalar functions.
 bool IsDeparseSafe(const Expression &expr);
 
+//! Render a filter expression whose column references still point at the scan's projection
+//! list (as handed to pushdown_complex_filter) as SQL. Returns an empty string when the
+//! expression cannot be rendered; the caller then leaves the filter in the plan.
+string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &column_ids,
+                           const vector<string> &column_names, const vector<LogicalType> &column_types);
+
 } // namespace duckdb

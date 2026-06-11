@@ -2,7 +2,11 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret.hpp"
+#include "duckdb/optimizer/column_lifetime_analyzer.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+
+#include <algorithm>
 
 #include "quack_scan.hpp"
 #include "quack_filter_sql.hpp"
@@ -201,6 +205,20 @@ private:
 	vector<ChunkResult> results;
 };
 
+//! All WHERE conjuncts for the rewritten remote query: the pushed-down table filters plus
+//! any expressions consumed at optimization time.
+static string BuildWhereClause(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
+	vector<string> clauses = bind_data.remote_filters;
+	if (input.filters && input.filters->HasFilters()) {
+		auto filter_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
+		                                            bind_data.column_types);
+		if (!filter_clause.empty()) {
+			clauses.push_back(std::move(filter_clause));
+		}
+	}
+	return StringUtil::Join(clauses, " AND ");
+}
+
 //! The columns the scan must output: with filter_prune, projection_ids selects the output
 //! subset of column_indexes and filter-only columns stay out of the SELECT list (they are
 //! evaluated in the WHERE instead).
@@ -239,12 +257,9 @@ static string BuildPushdownQuery(const QuackScanBindData &bind_data, const Table
 		query = "SELECT " + query + " ";
 	}
 	query += StringUtil::Format("FROM %s", SQLIdentifier(bind_data.table_name));
-	if (input.filters && input.filters->HasFilters()) {
-		auto where_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
-		                                           bind_data.column_types);
-		if (!where_clause.empty()) {
-			query += " WHERE " + where_clause;
-		}
+	auto where_clause = BuildWhereClause(bind_data, input);
+	if (!where_clause.empty()) {
+		query += " WHERE " + where_clause;
 	}
 
 	return query;
@@ -254,11 +269,7 @@ static string BuildPushdownQuery(const QuackScanBindData &bind_data, const Table
 //! Returns an empty string when the bind-time result can stream as-is: no filters to enforce
 //! and either the full width is needed or the data already arrived in the bind-time batch.
 static string BuildByNamePushdownQuery(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
-	string where_clause;
-	if (input.filters && input.filters->HasFilters()) {
-		where_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
-		                                      bind_data.column_types);
-	}
+	auto where_clause = BuildWhereClause(bind_data, input);
 	auto output_columns = OutputColumns(input);
 	bool narrowing = output_columns.size() < bind_data.column_types.size();
 	for (auto &col_id : output_columns) {
@@ -424,6 +435,43 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 	}
 }
 
+static bool QuackScanPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	// anything accepted here becomes a required filter the scan must enforce, so acceptance
+	// has to equal serializability
+	return IsDeparseSafe(expr);
+}
+
+static void QuackScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                           vector<unique_ptr<Expression>> &filters) {
+	if (!bind_data_p) {
+		return;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	auto &column_ids = get.GetColumnIds();
+	for (idx_t i = 0; i < filters.size();) {
+		auto &expr = *filters[i];
+		// single-column non-throwing expressions go through the regular table-filter path,
+		// which keeps them visible for statistics and EXPLAIN; consume only what that path
+		// will not take (e.g. fallible functions like json extraction, or predicates over
+		// several columns)
+		vector<ColumnBinding> bindings;
+		ColumnLifetimeAnalyzer::ExtractColumnBindings(expr, bindings);
+		bool single_column = !bindings.empty() && std::all_of(bindings.begin(), bindings.end(),
+		                                                      [&](const ColumnBinding &b) { return b == bindings[0]; });
+		if (expr.IsVolatile() || bindings.empty() || (single_column && !expr.CanThrow())) {
+			i++;
+			continue;
+		}
+		auto rendered = RenderComplexFilter(expr, column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			i++;
+			continue;
+		}
+		bind_data.remote_filters.push_back(std::move(rendered));
+		filters.erase(filters.begin() + NumericCast<int64_t>(i));
+	}
+}
+
 static OperatorPartitionData QuackScanGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
 	auto &local_state = input.local_state->Cast<QuackScanLocalState>();
 	// If we haven't received a batch yet, fall back to 0 so downstream doesn't choke; the
@@ -437,6 +485,9 @@ InsertionOrderPreservingMap<string> QuackScanToString(TableFunctionToStringInput
 	auto &bind_data = input.bind_data->Cast<QuackScanBindData>();
 	InsertionOrderPreservingMap<string> result;
 	result["Server"] = bind_data.client_connection->ServerURI().Uri();
+	if (!bind_data.remote_filters.empty()) {
+		result["Remote Filters"] = StringUtil::Join(bind_data.remote_filters, " AND ");
+	}
 	return result;
 }
 
@@ -471,6 +522,8 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.filter_pushdown = true;
 	fun.filter_prune = true;
+	fun.pushdown_expression = QuackScanPushdownExpression;
+	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
 	return fun;
 }
 
@@ -486,6 +539,8 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
 	fun.filter_pushdown = true;
 	fun.filter_prune = true;
+	fun.pushdown_expression = QuackScanPushdownExpression;
+	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
 	return fun;
 }
 

@@ -66,6 +66,17 @@ EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = 42;
 ----
 physical_plan	<!REGEX>:.*FILTER.*
 
+# A predicate over two columns ships whole into the remote WHERE clause
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = doubled;
+----
+physical_plan	<REGEX>:.*Remote Filters:.*i = doubled.*
+
+query I
+select count(*) from rpc.main.test_data where i = doubled;
+----
+1
+
 # Correctness with the scan-level pushdown path
 query I
 select i from rpc.main.test_data where i = 42;

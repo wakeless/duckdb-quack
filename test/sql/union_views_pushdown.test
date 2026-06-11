@@ -97,14 +97,15 @@ a	2
 b	2
 
 # ---------------------------------------------------------------------------
-# A predicate over two columns cannot be pushed into the scan: the client
-# keeps a FILTER and results stay correct.
+# A predicate over two columns ships whole into the remote WHERE clause.
 # ---------------------------------------------------------------------------
 
+# (the local leg's table scan cannot absorb a two-column predicate, so a
+# client FILTER remains for that side only)
 query II con2
 explain select site, id from projects where name < org;
 ----
-physical_plan	<REGEX>:.*FILTER.*
+physical_plan	<REGEX>:.*Remote Filters:.*
 
 query II con2
 select site, id from projects where name < org order by site, id;
@@ -114,6 +115,45 @@ a	2
 b	1
 b	2
 b	3
+
+# ---------------------------------------------------------------------------
+# Single-column predicates the table-filter machinery rejects (e.g. an OR arm
+# with IS NULL) ship as expressions.
+# ---------------------------------------------------------------------------
+
+query II con2
+explain select site, id from projects where org = 'org_b' or org is null;
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+query II con2
+select site, id from projects where org = 'org_b' or org is null order by site, id;
+----
+b	2
+b	4
+
+# A function the scan does not know stays client-side; results are unchanged.
+query II con2
+select site, id from projects where levenshtein(name, org) > 4 order by site, id;
+----
+a	2
+a	3
+b	2
+
+# ---------------------------------------------------------------------------
+# Fallible expressions (e.g. JSON extraction) are held above the union leg's
+# projection by the planner, so they filter client-side; results stay correct.
+# ---------------------------------------------------------------------------
+
+require json
+
+statement ok con2
+create view tagged as (select 'a' as site, id, '{"flag": "on"}' as settings from local_site.projects) union all (select 'b' as site, id, '{"flag": "off"}' as settings from remote.remote_site.projects);
+
+query II con2
+select site, count(*) from tagged where json_extract_string(settings::JSON, '$."flag"') = 'on' group by site order by site;
+----
+a	3
 
 # ---------------------------------------------------------------------------
 # Filters compose with aggregates above the union: only matching rows leave
