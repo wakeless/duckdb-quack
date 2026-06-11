@@ -53,6 +53,9 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	return_types = bind_response->Types();
 	names = bind_response->Names();
 
+	bind_data->remote_query = query;
+	bind_data->column_names = names;
+	bind_data->column_types = return_types;
 	bind_data->results = std::move(bind_response->MutableResults());
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
@@ -113,6 +116,9 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	names = bind_response->Names();
 
 	// new stuff
+	bind_data->remote_query = query;
+	bind_data->column_names = names;
+	bind_data->column_types = return_types;
 	bind_data->results = std::move(bind_response->MutableResults());
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
