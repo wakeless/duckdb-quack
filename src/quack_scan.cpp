@@ -201,14 +201,27 @@ private:
 	vector<ChunkResult> results;
 };
 
+//! The columns the scan must output: with filter_prune, projection_ids selects the output
+//! subset of column_indexes and filter-only columns stay out of the SELECT list (they are
+//! evaluated in the WHERE instead).
+static vector<ColumnIndex> OutputColumns(const TableFunctionInitInput &input) {
+	if (!input.CanRemoveFilterColumns()) {
+		return input.column_indexes;
+	}
+	vector<ColumnIndex> result;
+	for (auto &proj_id : input.projection_ids) {
+		result.push_back(input.column_indexes[proj_id]);
+	}
+	return result;
+}
+
 static string BuildPushdownQuery(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
 	string query;
 
 	// Projection: select only the columns DuckDB actually needs in the output.
-	// With filter_prune, projection_ids indexes into column_ids for output columns only.
-	// Filter-only columns are in column_ids but NOT in projection_ids — they go in WHERE, not SELECT.
-	if (!input.column_indexes.empty()) {
-		for (auto &col_id : input.column_indexes) {
+	auto output_columns = OutputColumns(input);
+	if (!output_columns.empty()) {
+		for (auto &col_id : output_columns) {
 			if (!query.empty()) {
 				query += ", ";
 			}
@@ -246,8 +259,9 @@ static string BuildByNamePushdownQuery(const QuackScanBindData &bind_data, const
 		where_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
 		                                      bind_data.column_types);
 	}
-	bool narrowing = input.column_indexes.size() < bind_data.column_types.size();
-	for (auto &col_id : input.column_indexes) {
+	auto output_columns = OutputColumns(input);
+	bool narrowing = output_columns.size() < bind_data.column_types.size();
+	for (auto &col_id : output_columns) {
 		if (col_id.IsVirtualColumn()) {
 			narrowing = true;
 		}
@@ -257,7 +271,7 @@ static string BuildByNamePushdownQuery(const QuackScanBindData &bind_data, const
 		return string();
 	}
 	vector<string> select_list;
-	for (auto &col_id : input.column_indexes) {
+	for (auto &col_id : output_columns) {
 		if (col_id.IsVirtualColumn()) {
 			auto virtual_column = col_id.GetPrimaryIndex();
 			if (virtual_column == COLUMN_IDENTIFIER_EMPTY || virtual_column == COLUMN_IDENTIFIER_ROW_ID) {
@@ -325,7 +339,8 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		input.bind_data->CastNoConst<QuackScanBindData>().owns_pending_result = false;
 	}
 	// we only multithread if there is more to fetch
-	return make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
+	auto projection_ids = input.CanRemoveFilterColumns() ? input.projection_ids : vector<idx_t>();
+	return make_uniq<QuackScanGlobalState>(input.column_indexes, std::move(projection_ids), std::move(results),
 	                                       needs_more_fetch, result_uuid, bind_data.client_connection,
 	                                       pushdown_applied);
 }
@@ -361,12 +376,15 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 				if (!chunk.RequiresPushdown()) {
 					output.Reference(response_chunk);
 				} else {
-					for (idx_t i = 0; i < global_state.column_ids.size(); i++) {
-						auto &index = global_state.column_ids[i];
+					// chunks hold the full-width relation; apply the projection (and the
+					// filter-column pruning, when set) client-side
+					auto &projection_ids = global_state.projection_ids;
+					auto output_count = projection_ids.empty() ? global_state.column_ids.size() : projection_ids.size();
+					for (idx_t i = 0; i < output_count; i++) {
+						auto &index = global_state.column_ids[projection_ids.empty() ? i : projection_ids[i]];
 						if (index.IsVirtualColumn()) {
-							// TODO
 							output.data[i].Reference(Value(output.data[i].GetType()), count_t(response_chunk.size()));
-							return;
+							continue;
 						}
 						auto col_idx = index.GetPrimaryIndex();
 						output.data[i].Reference(response_chunk.data[col_idx]);
@@ -452,6 +470,7 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.filter_pushdown = true;
+	fun.filter_prune = true;
 	return fun;
 }
 
@@ -466,6 +485,7 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
 	fun.filter_pushdown = true;
+	fun.filter_prune = true;
 	return fun;
 }
 
