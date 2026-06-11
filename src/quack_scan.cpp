@@ -2,10 +2,10 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 #include "quack_scan.hpp"
+#include "quack_filter_sql.hpp"
 #include "quack_client.hpp"
 #include "include/storage/quack_catalog.hpp"
 #include "storage/quack_transaction.hpp"
@@ -166,10 +166,11 @@ struct QuackScanLocalState : public LocalTableFunctionState {
 struct QuackScanGlobalState : GlobalTableFunctionState {
 	explicit QuackScanGlobalState(vector<ColumnIndex> column_ids_p, vector<idx_t> projection_id_p,
 	                              vector<ChunkResult> results_p, bool needs_more_fetch_p, hugeint_t result_uuid_p,
-	                              shared_ptr<QuackClientConnection> client_connection_p)
+	                              shared_ptr<QuackClientConnection> client_connection_p, bool pushdown_applied_p)
 	    : max_threads(needs_more_fetch_p ? MAX_THREADS : 1), column_ids(std::move(column_ids_p)),
 	      projection_ids(std::move(projection_id_p)), needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid_p),
-	      client_connection(std::move(client_connection_p)), results(std::move(results_p)) {
+	      client_connection(std::move(client_connection_p)), pushdown_applied(pushdown_applied_p),
+	      results(std::move(results_p)) {
 	}
 	~QuackScanGlobalState() override {
 		if (needs_more_fetch && client_connection) {
@@ -186,6 +187,9 @@ struct QuackScanGlobalState : GlobalTableFunctionState {
 	atomic<bool> needs_more_fetch;
 	hugeint_t result_uuid;
 	shared_ptr<QuackClientConnection> client_connection;
+	//! Whether the server already applied projection/filters to this result; fetched chunks
+	//! then come back final instead of needing the client-side projection
+	bool pushdown_applied;
 
 	vector<ChunkResult> TryGetResults() {
 		lock_guard<mutex> guard(lock);
@@ -221,49 +225,55 @@ static string BuildPushdownQuery(const QuackScanBindData &bind_data, const Table
 		}
 		query = "SELECT " + query + " ";
 	}
-	// 	vector<string> selected_columns;
-	// 	if (!input.projection_ids.empty()) {
-	// 		for (auto &proj_id : input.projection_ids) {
-	// 			auto col_id = input.column_ids[proj_id];
-	// 			if (IsRowIdColumnId(col_id) || col_id >= bind_data.column_names.size()) {
-	// 				continue;
-	// 			}
-	// 			selected_columns.push_back(KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_id]));
-	// 		}
-	// 	} else {
-	// 		for (auto &col_id : input.column_ids) {
-	// 			if (IsRowIdColumnId(col_id) || col_id >= bind_data.column_names.size()) {
-	// 				continue;
-	// 			}
-	// 			selected_columns.push_back(KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_id]));
-	// 		}
-	// 	}
-	// 	if (!selected_columns.empty()) {
-	// 		query = "SELECT " + StringUtil::Join(selected_columns, ", ") + " ";
-	// 	}
-	// }
 	query += StringUtil::Format("FROM %s", SQLIdentifier(bind_data.table_name));
-	//
-	// // Filters: build WHERE clause from pushable filters
-	// if (input.filters) {
-	// 	vector<string> where_clauses;
-	// 	for (auto &entry : input.filters->filters) {
-	// 		auto col_idx = entry.second.GetIndex();
-	// 		if (col_idx >= bind_data.column_names.size()) {
-	// 			continue;
-	// 		}
-	// 		auto &filter = entry.Filter();
-	// 		if (!CanPushdownFilter(filter)) {
-	// 			continue;
-	// 		}
-	// 		auto col_name = KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_idx]);
-	// 		where_clauses.push_back(filter.ToString(col_name));
-	// 	}
-	// 	if (!where_clauses.empty()) {
-	// 		query += " WHERE " + StringUtil::Join(where_clauses, " AND ");
-	// 	}
-	// }
+	if (input.filters && input.filters->HasFilters()) {
+		auto where_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
+		                                           bind_data.column_types);
+		if (!where_clause.empty()) {
+			query += " WHERE " + where_clause;
+		}
+	}
 
+	return query;
+}
+
+//! Rebuild the remote SQL for a by-name scan with projection/filters applied server-side.
+//! Returns an empty string when the bind-time result can stream as-is: no filters to enforce
+//! and either the full width is needed or the data already arrived in the bind-time batch.
+static string BuildByNamePushdownQuery(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
+	string where_clause;
+	if (input.filters && input.filters->HasFilters()) {
+		where_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
+		                                      bind_data.column_types);
+	}
+	bool narrowing = input.column_indexes.size() < bind_data.column_types.size();
+	for (auto &col_id : input.column_indexes) {
+		if (col_id.IsVirtualColumn()) {
+			narrowing = true;
+		}
+	}
+	// projection alone only saves wire time if the server still holds undelivered batches
+	if (where_clause.empty() && !(narrowing && bind_data.needs_more_fetch)) {
+		return string();
+	}
+	vector<string> select_list;
+	for (auto &col_id : input.column_indexes) {
+		if (col_id.IsVirtualColumn()) {
+			auto virtual_column = col_id.GetPrimaryIndex();
+			if (virtual_column == COLUMN_IDENTIFIER_EMPTY || virtual_column == COLUMN_IDENTIFIER_ROW_ID) {
+				select_list.push_back("NULL::BIGINT");
+			} else {
+				throw InternalException("Unsupported virtual column index");
+			}
+		} else {
+			select_list.push_back(SQLIdentifier::ToString(bind_data.column_names[col_id.GetPrimaryIndex()]));
+		}
+	}
+	auto query = "SELECT " + (select_list.empty() ? string("*") : StringUtil::Join(select_list, ", ")) +
+	             StringUtil::Format(" FROM (%s)", bind_data.remote_query);
+	if (!where_clause.empty()) {
+		query += " WHERE " + where_clause;
+	}
 	return query;
 }
 
@@ -275,10 +285,22 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 	// We execute the query here, right before scanning, so the result is fresh.
 	vector<ChunkResult> results;
 	bool needs_more_fetch = bind_data.needs_more_fetch;
+	bool pushdown_applied = true;
 	hugeint_t result_uuid;
+	string query;
 	if (!bind_data.table_name.empty()) {
 		// apply pushdown to the query
-		auto query = BuildPushdownQuery(bind_data, input);
+		query = BuildPushdownQuery(bind_data, input);
+	} else {
+		query = BuildByNamePushdownQuery(bind_data, input);
+	}
+	if (!query.empty()) {
+		if (bind_data.table_name.empty() && bind_data.owns_pending_result) {
+			// the bind-time result streams the raw relation; drop it in favour of the
+			// rewritten query
+			bind_data.client_connection->CloseResult(bind_data.result_uuid);
+			input.bind_data->CastNoConst<QuackScanBindData>().owns_pending_result = false;
+		}
 		auto &client_connection = *bind_data.client_connection;
 		auto client_wrapper = client_connection.GetClient(context);
 		auto &client = client_wrapper->GetClient();
@@ -292,6 +314,7 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		}
 		result_uuid = response_message->ResultUUID();
 	} else {
+		pushdown_applied = false;
 		for (auto &chunk_ref : bind_data.results) {
 			auto &chunk = chunk_ref->Chunk();
 			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
@@ -303,7 +326,8 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 	}
 	// we only multithread if there is more to fetch
 	return make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
-	                                       needs_more_fetch, result_uuid, bind_data.client_connection);
+	                                       needs_more_fetch, result_uuid, bind_data.client_connection,
+	                                       pushdown_applied);
 }
 
 unique_ptr<LocalTableFunctionState> QuackScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
@@ -365,11 +389,11 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 				global_state.needs_more_fetch = false;
 				return;
 			}
-			// Catalog-path scans re-PREPARE with the projection applied server-side, so fetched
-			// chunks are final. By-name scans stream the raw relation; every fetched chunk still
-			// needs the client-side projection.
-			auto pushdown_type = bind_data.table_name.empty() ? ChunkResultPushdownType::REQUIRES_PUSHDOWN
-			                                                  : ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
+			// Scans that re-PREPAREd with pushdown applied get final chunks back; a scan
+			// streaming its bind-time result still needs the client-side projection on
+			// every fetched chunk.
+			auto pushdown_type = global_state.pushdown_applied ? ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED
+			                                                   : ChunkResultPushdownType::REQUIRES_PUSHDOWN;
 			// set up buffer for scan in next iteration
 			for (auto &chunk : fetch_response->MutableResults()) {
 				local_state.results.emplace(chunk->Chunk(), pushdown_type);
@@ -427,8 +451,7 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.serialize = QuackScanSerialize;
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
-	// fun.filter_pushdown = true;
-	// fun.filter_prune = true;
+	fun.filter_pushdown = true;
 	return fun;
 }
 
@@ -442,8 +465,7 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
-	// fun.filter_pushdown = true;
-	// fun.filter_prune = true;
+	fun.filter_pushdown = true;
 	return fun;
 }
 

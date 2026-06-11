@@ -63,6 +63,29 @@ select count(*) from events e join metrics m on e.id = m.id and e.site = m.site;
 200000
 
 # ---------------------------------------------------------------------------
+# A selective filter through the union view runs on the server: the matching
+# rows fit in the PREPARE response, so the scan never issues a follow-up
+# FETCH for the remote leg.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call enable_logging('Quack');
+
+query II con2
+select site, count(*) from events where id < 100 group by site order by site;
+----
+a	100
+b	100
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'FETCH_REQUEST';
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
 # A pending result abandoned before it is drained tells the server to drop it
 # instead of leaving it buffered. EXPLAIN binds the by-name scan (which
 # PREPAREs the result) but never scans it, so teardown must close it.

@@ -1,0 +1,139 @@
+# name: test/sql/union_views_pushdown.test
+# description: filters over a union view ship into the remote leg's scan
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# ---------------------------------------------------------------------------
+# Server side: a base table exposed as a view, so the client binds it as an
+# opaque by-name scan.
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.projects_base(id int, org varchar, name varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.projects_base values
+    (1, 'org_a', 'beta'),
+    (2, 'org_b', 'gamma'),
+    (3, 'internal', 'infra'),
+    (4, NULL, 'orphan');
+
+statement ok quack_db:quack_server_con
+create view remote_site.projects as from remote_site.projects_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.projects(id int, org varchar, name varchar);
+
+statement ok con2
+insert into local_site.projects values
+    (1, 'org_a', 'alpha'),
+    (2, 'org_c', 'delta'),
+    (3, 'internal', 'tools');
+
+statement ok con2
+create view projects as (select 'a' as site, * from local_site.projects) union all (select 'b' as site, * from remote.remote_site.projects);
+
+# ---------------------------------------------------------------------------
+# A constant comparison distributed through the union lands inside the remote
+# scan instead of as a client-side FILTER above it.
+# ---------------------------------------------------------------------------
+
+query II con2
+explain select site, id from projects where org = 'org_a';
+----
+physical_plan	<REGEX>:.*QUACK_QUERY_BY_NAME.*Filters:.*org = 'org_a'.*
+
+query II con2
+explain select site, id from projects where org = 'org_a';
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+query II con2
+select site, id from projects where org = 'org_a' order by site, id;
+----
+a	1
+b	1
+
+# ---------------------------------------------------------------------------
+# IS NULL / IS NOT NULL stay correct (bare null checks ship only once the
+# scan accepts single-column expressions).
+# ---------------------------------------------------------------------------
+
+query II con2
+select site, id from projects where org is null order by site, id;
+----
+b	4
+
+query I con2
+select count(*) from projects where org is not null;
+----
+6
+
+# ---------------------------------------------------------------------------
+# An integer IN list collapses to a pushable range/IN filter.
+# ---------------------------------------------------------------------------
+
+query I con2
+select count(*) from projects where id in (1, 2);
+----
+4
+
+# A varchar IN list is distributed as an OR; whether it ships or stays as a
+# client-side filter, the results are the same.
+query II con2
+select site, id from projects where org in ('org_b', 'org_c') order by site, id;
+----
+a	2
+b	2
+
+# ---------------------------------------------------------------------------
+# A predicate over two columns cannot be pushed into the scan: the client
+# keeps a FILTER and results stay correct.
+# ---------------------------------------------------------------------------
+
+query II con2
+explain select site, id from projects where name < org;
+----
+physical_plan	<REGEX>:.*FILTER.*
+
+query II con2
+select site, id from projects where name < org order by site, id;
+----
+a	1
+a	2
+b	1
+b	2
+b	3
+
+# ---------------------------------------------------------------------------
+# Filters compose with aggregates above the union: only matching rows leave
+# the server.
+# ---------------------------------------------------------------------------
+
+query II con2
+select site, count(*) from projects where org = 'internal' group by site order by site;
+----
+a	1
+b	1
+
+# The filtered scan and an unfiltered scan of the same view coexist in one
+# query (two pending results on one connection).
+query I con2
+select count(*) from projects p join projects q on p.id = q.id and p.site = q.site where p.org = 'org_a';
+----
+2
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
