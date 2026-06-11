@@ -496,7 +496,8 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		// the append runs on the same DuckDB connection and would invalidate a live stream
 		MaterializeLiveResults(db, connection);
 		auto &context = *connection.duckdb_connection->context;
-		auto table_info = context.TableInfo(append_request_message.SchemaName(), append_request_message.TableName());
+		auto table_info = context.TableInfo(Identifier(append_request_message.SchemaName()),
+		                                    Identifier(append_request_message.TableName()));
 		if (!table_info) {
 			return make_uniq<ErrorResponse>("Table %s.%s does not exist",
 			                                SQLIdentifier(append_request_message.SchemaName()),
