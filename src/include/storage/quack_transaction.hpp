@@ -33,7 +33,7 @@ public:
 	static QuackTransaction &Get(ClientContext &context, Catalog &catalog);
 	static QuackTransaction &Get(CatalogTransaction transaction);
 
-	unique_ptr<ColumnDataCollection> Query(const string &query);
+	unique_ptr<ColumnDataCollection> Query(const string &query, bool allow_reconnect = false);
 
 private:
 	QuackCatalog &quack_catalog;

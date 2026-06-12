@@ -32,6 +32,12 @@
         "name": "message",
         "type": "string",
         "serialize_property": "error.RawMessage()"
+      },
+      {
+        "id": 2,
+        "name": "error_code",
+        "type": "string",
+        "default": "string()"
       }
     ],
     "constructor": ["message"]

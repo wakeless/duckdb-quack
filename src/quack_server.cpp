@@ -220,7 +220,9 @@ unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
 	if (MessageRequiresConnection(header.type)) {
 		connection = GetConnection(header.connection_id);
 		if (!connection) {
-			return make_uniq<ErrorResponse>("Invalid connection id");
+			auto error = make_uniq<ErrorResponse>("Invalid connection id");
+			error->SetErrorCode(ErrorResponse::CONNECTION_NOT_FOUND);
+			return error;
 		}
 	}
 

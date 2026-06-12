@@ -75,11 +75,13 @@ unique_ptr<DisconnectMessage> DisconnectMessage::Deserialize(Deserializer &deser
 
 void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
+	serializer.WritePropertyWithDefault<string>(2, "error_code", error_code);
 }
 
 unique_ptr<ErrorResponse> ErrorResponse::Deserialize(Deserializer &deserializer) {
 	auto message = deserializer.ReadPropertyWithDefault<string>(1, "message");
 	auto result = duckdb::unique_ptr<ErrorResponse>(new ErrorResponse(std::move(message)));
+	deserializer.ReadPropertyWithDefault<string>(2, "error_code", result->error_code);
 	return result;
 }
 

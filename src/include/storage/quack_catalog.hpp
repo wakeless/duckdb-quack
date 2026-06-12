@@ -67,9 +67,10 @@ public:
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, const string &sql) override;
 
-	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query);
+	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query,
+	                                                        bool allow_reconnect = false);
 	const QuackUri &GetServerUri();
-	const string &GetConnectionId();
+	string GetConnectionId();
 
 	shared_ptr<QuackClientConnection> GetClientConnection();
 

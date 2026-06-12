@@ -395,6 +395,17 @@ public:
 	const string &ErrorMessage() const {
 		return error.Message();
 	}
+	//! Machine-readable error kind; empty for plain errors (and for messages from servers
+	//! that predate the field)
+	const string &ErrorCode() const {
+		return error_code;
+	}
+	void SetErrorCode(string code) {
+		error_code = std::move(code);
+	}
+
+	//! The connection id in the request is not (or no longer) known to the server
+	static constexpr const char *CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND";
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<ErrorResponse> Deserialize(Deserializer &deserializer);
@@ -405,6 +416,7 @@ protected:
 
 private:
 	ErrorData error;
+	string error_code;
 };
 
 } // namespace duckdb

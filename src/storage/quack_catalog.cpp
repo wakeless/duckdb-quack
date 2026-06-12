@@ -36,8 +36,8 @@ QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, C
 
 QuackLoadCatalogData QuackCatalog::LoadCatalog(ClientContext &context) {
 	QuackLoadCatalogData result;
-	result.schemas = ExecuteCommandInternal(context, QuackSchemaSet::GetLoadQuery());
-	result.tables = ExecuteCommandInternal(context, QuackTableSet::GetLoadQuery());
+	result.schemas = ExecuteCommandInternal(context, QuackSchemaSet::GetLoadQuery(), /*allow_reconnect=*/true);
+	result.tables = ExecuteCommandInternal(context, QuackTableSet::GetLoadQuery(), /*allow_reconnect=*/true);
 	return result;
 }
 
@@ -68,14 +68,24 @@ const QuackUri &QuackCatalog::GetServerUri() {
 	return client_connection->ServerURI();
 }
 
-unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query,
+                                                                      bool allow_reconnect) {
 	// FIXME this will break with many results!
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
-	// get a client to query
-	auto client_wrapper = client_connection->GetClient(context);
-	auto &client = client_wrapper->GetClient();
-	auto response =
-	    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(GetConnectionId(), query));
+	unique_ptr<PrepareResponseMessage> response;
+	if (allow_reconnect) {
+		// session-initiating commands (catalog loads, a transaction-opening BEGIN) can safely
+		// re-handshake when the server no longer knows this session
+		auto make_prepare = [&](const string &connection_id) {
+			return make_uniq<PrepareRequestMessage>(connection_id, query);
+		};
+		response = client_connection->RequestWithReconnect<PrepareResponseMessage>(context, make_prepare);
+	} else {
+		auto client_wrapper = client_connection->GetClient(context);
+		auto &client = client_wrapper->GetClient();
+		response =
+		    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(GetConnectionId(), query));
+	}
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
@@ -92,7 +102,7 @@ void QuackCatalog::Refresh(ClientContext &context) {
 	schemas->Reload(context, *this, load_info);
 }
 
-const string &QuackCatalog::GetConnectionId() {
+string QuackCatalog::GetConnectionId() {
 	return client_connection->ConnectionId();
 }
 
