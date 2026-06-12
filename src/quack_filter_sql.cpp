@@ -2,6 +2,7 @@
 
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -148,6 +149,42 @@ string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &co
 	}
 	StripNonColumnAliases(*copy);
 	return copy->ToString();
+}
+
+string RenderAggregateCall(const Expression &aggregate_p, const vector<ColumnIndex> &column_ids,
+                           const vector<string> &column_names, const vector<LogicalType> &column_types) {
+	if (aggregate_p.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+		return string();
+	}
+	auto &aggregate = aggregate_p.Cast<BoundAggregateExpression>();
+	if (aggregate.GetFilter() || aggregate.GetOrderBys()) {
+		return string();
+	}
+	auto &name = aggregate.Function().GetName().GetIdentifierName();
+	if (name == "count_star") {
+		return aggregate.GetChildren().empty() ? "count(*)" : string();
+	}
+	static const char *allowed[] = {"count", "sum", "min", "max", "avg"};
+	bool found = false;
+	for (auto &entry : allowed) {
+		if (StringUtil::CIEquals(entry, name)) {
+			found = true;
+			break;
+		}
+	}
+	if (!found || aggregate.GetChildren().empty()) {
+		return string();
+	}
+	vector<string> arguments;
+	for (auto &child : aggregate.GetChildren()) {
+		auto rendered = RenderComplexFilter(*child, column_ids, column_names, column_types);
+		if (rendered.empty()) {
+			return string();
+		}
+		arguments.push_back(std::move(rendered));
+	}
+	return StringUtil::Format("%s(%s%s)", SQLIdentifier(name), aggregate.IsDistinct() ? "DISTINCT " : "",
+	                          StringUtil::Join(arguments, ", "));
 }
 
 string BuildFilterWhereClause(const TableFilterSet &filters, const vector<ColumnIndex> &column_indexes,

@@ -27,4 +27,9 @@ bool IsDeparseSafe(const Expression &expr);
 string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &column_ids,
                            const vector<string> &column_names, const vector<LogicalType> &column_types);
 
+//! Render an aggregate call (column references as above) as SQL, e.g. "count(*)" or
+//! "sum(DISTINCT \"val\")". Returns an empty string when the call cannot be reproduced.
+string RenderAggregateCall(const Expression &aggregate, const vector<ColumnIndex> &column_ids,
+                           const vector<string> &column_names, const vector<LogicalType> &column_types);
+
 } // namespace duckdb

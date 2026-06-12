@@ -469,6 +469,95 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 	}
 }
 
+static bool QuackScanPushdownAggregate(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                       const vector<unique_ptr<Expression>> &groups,
+                                       const vector<unique_ptr<Expression>> &aggregates, vector<LogicalType> &new_types,
+                                       vector<Identifier> &new_names) {
+	if (!bind_data_p || groups.empty() || aggregates.empty()) {
+		return false;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	if (!bind_data.table_name.empty() || bind_data.remote_query.empty()) {
+		return false;
+	}
+	auto &column_ids = get.GetColumnIds();
+
+	// render everything before touching any state, so a failed render leaves the scan as-is
+	vector<string> select_list;
+	vector<string> group_by;
+	vector<LogicalType> types;
+	vector<string> names;
+	case_insensitive_set_t used_names;
+	auto unique_name = [&](string base) {
+		auto candidate = base;
+		for (idx_t i = 2; used_names.find(candidate) != used_names.end(); i++) {
+			candidate = base + "_" + to_string(i);
+		}
+		used_names.insert(candidate);
+		return candidate;
+	};
+	for (idx_t i = 0; i < groups.size(); i++) {
+		auto &group = *groups[i];
+		auto rendered = RenderComplexFilter(group, column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			return false;
+		}
+		string base = "group_" + to_string(i + 1);
+		if (group.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto col = group.Cast<BoundColumnRefExpression>().Binding().column_index.GetIndex();
+			base = bind_data.column_names[column_ids[col].GetPrimaryIndex()];
+		}
+		// constant group keys (leg tags) group as well: unlike a global aggregate, grouping by
+		// a constant yields no row for an empty input, matching the aggregate being replaced
+		group_by.push_back(to_string(select_list.size() + 1));
+		auto name = unique_name(base);
+		select_list.push_back(rendered + " AS " + SQLIdentifier::ToString(name));
+		types.push_back(group.GetReturnType());
+		names.push_back(std::move(name));
+	}
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto rendered = RenderAggregateCall(*aggregates[i], column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			return false;
+		}
+		auto name = unique_name("aggregate_" + to_string(i + 1));
+		select_list.push_back(rendered + " AS " + SQLIdentifier::ToString(name));
+		types.push_back(aggregates[i]->GetReturnType());
+		names.push_back(std::move(name));
+	}
+	// filters already pushed into this scan apply before the aggregation
+	vector<string> where_clauses = bind_data.remote_filters;
+	if (get.table_filters.HasFilters()) {
+		auto filter_clause =
+		    BuildFilterWhereClause(get.table_filters, column_ids, bind_data.column_names, bind_data.column_types);
+		if (!filter_clause.empty()) {
+			where_clauses.push_back(std::move(filter_clause));
+		}
+	}
+
+	auto query =
+	    "SELECT " + StringUtil::Join(select_list, ", ") + StringUtil::Format(" FROM (%s)", bind_data.remote_query);
+	if (!where_clauses.empty()) {
+		query += " WHERE " + StringUtil::Join(where_clauses, " AND ");
+	}
+	query += " GROUP BY " + StringUtil::Join(group_by, ", ");
+
+	// commit: the scan now produces the grouped result; the bind-time raw-relation result is
+	// not replayable (its pending server result is still closed by the bind data destructor)
+	bind_data.remote_query = std::move(query);
+	bind_data.column_names = names;
+	bind_data.column_types = types;
+	bind_data.remote_filters.clear();
+	bind_data.results.clear();
+	bind_data.has_unconsumed_bind_result = false;
+	bind_data.needs_more_fetch = true;
+	new_types = std::move(types);
+	for (auto &name : names) {
+		new_names.emplace_back(std::move(name));
+	}
+	return true;
+}
+
 static bool QuackScanPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	// anything accepted here becomes a required filter the scan must enforce, so acceptance
 	// has to equal serializability
@@ -558,6 +647,7 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.filter_prune = true;
 	fun.pushdown_expression = QuackScanPushdownExpression;
 	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
+	fun.pushdown_aggregate = QuackScanPushdownAggregate;
 	return fun;
 }
 
@@ -575,6 +665,7 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.filter_prune = true;
 	fun.pushdown_expression = QuackScanPushdownExpression;
 	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
+	fun.pushdown_aggregate = QuackScanPushdownAggregate;
 	return fun;
 }
 

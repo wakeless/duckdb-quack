@@ -1,0 +1,249 @@
+# name: test/sql/union_views_aggregate.test
+# description: grouped aggregates over union views execute inside the remote scan
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# ---------------------------------------------------------------------------
+# Server side: base tables exposed as views (opaque by-name scans client-side).
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.projects_base(id int, org varchar, points int);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.projects_base values
+    (1, 'org_a', 10),
+    (2, 'org_b', 20),
+    (3, 'org_a', 30),
+    (4, NULL, 40),
+    (5, 'internal', 50);
+
+statement ok quack_db:quack_server_con
+create table remote_site.memberships_base(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.memberships_base values
+    (1, 'org_a', 101, 'member', 'false'),
+    (1, 'org_a', 102, 'member', NULL),
+    (1, 'org_a', 103, 'member', 'true'),
+    (1, 'org_a', 104, 'admin', 'false'),
+    (2, 'org_b', 201, 'member', 'false'),
+    (3, 'org_a', 301, 'member', 'false');
+
+statement ok quack_db:quack_server_con
+create view remote_site.projects as from remote_site.projects_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.memberships as from remote_site.memberships_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.projects(id int, org varchar, points int);
+
+statement ok con2
+insert into local_site.projects values
+    (1, 'org_a', 1),
+    (2, 'org_c', 2),
+    (3, 'internal', 3);
+
+statement ok con2
+create table local_site.memberships(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok con2
+insert into local_site.memberships values
+    (1, 'org_a', 11, 'member', 'false'),
+    (1, 'org_a', 12, 'member', 'false'),
+    (2, 'org_c', 21, 'member', NULL),
+    (2, 'org_c', 22, 'member', 'true'),
+    (1, 'org_a', 13, 'admin', NULL);
+
+statement ok con2
+create view projects as (select 'a' as site, * from local_site.projects) union all (select 'b' as site, * from remote.remote_site.projects);
+
+statement ok con2
+create view memberships as (select 'a' as site, * from local_site.memberships) union all (select 'b' as site, * from remote.remote_site.memberships);
+
+# ---------------------------------------------------------------------------
+# Grouping by the leg tag makes groups leg-disjoint: the remote leg's
+# aggregate runs inside the scan, visible as a GROUP BY in the shipped query.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call enable_logging('Quack');
+
+query II con2
+select site, count(*) from projects group by site order by site;
+----
+a	3
+b	5
+
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%GROUP BY%';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
+# Filters apply before the remote aggregation; extra group keys ride along.
+# ---------------------------------------------------------------------------
+
+query IIII con2
+select site, org, count(*), sum(points) from projects where org = 'org_a' group by site, org order by site;
+----
+a	org_a	1	1
+b	org_a	2	40
+
+# ---------------------------------------------------------------------------
+# The aggregate allowlist: count(*), count, sum, min, max, count(DISTINCT).
+# ---------------------------------------------------------------------------
+
+query IIIIII con2
+select site, count(*), sum(points), min(points), max(points), count(distinct org) from projects group by site order by site;
+----
+a	3	6	1	3	3
+b	5	150	10	50	3
+
+query IR con2
+select site, avg(points) from projects group by site order by site;
+----
+a	2.0
+b	30.0
+
+# ---------------------------------------------------------------------------
+# The production shape: a filtered count per entity over a union view.
+# ---------------------------------------------------------------------------
+
+query IIII con2
+select project_id, org, site, count(*) as members
+from memberships
+where role = 'member' and (removed = 'false' or removed is null)
+group by project_id, org, site
+order by site, project_id;
+----
+1	org_a	a	2
+2	org_c	a	1
+1	org_a	b	2
+2	org_b	b	1
+3	org_a	b	1
+
+# ...and the same aggregate as a derived table in a reporting join.
+query III con2
+select p.site, p.id, mc.members
+from projects p
+left join (
+    select project_id, org, site, count(*) as members
+    from memberships
+    where role = 'member' and (removed = 'false' or removed is null)
+    group by 1, 2, 3
+) mc on mc.project_id = p.id and mc.org is not distinct from p.org and mc.site = p.site
+order by p.site, p.id;
+----
+a	1	2
+a	2	1
+a	3	NULL
+b	1	2
+b	2	1
+b	3	1
+b	4	NULL
+b	5	NULL
+
+# HAVING filters the combined result and does not block the pushdown.
+query II con2
+select site, count(*) as c from projects group by site having count(*) > 3 order by site;
+----
+b	5
+
+# ---------------------------------------------------------------------------
+# Shapes that must NOT split: results stay correct and no GROUP BY ships.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging('Quack');
+
+# group keys without the leg tag: groups span legs
+query II con2
+select org, count(*) from projects group by org order by all;
+----
+internal	2
+org_a	3
+org_b	1
+org_c	1
+NULL	1
+
+# an aggregate outside the allowlist
+query II con2
+select site, median(points) from projects group by site order by site;
+----
+a	2
+b	30
+
+# grouping sets
+query II con2
+select site, count(*) from projects group by rollup(site) order by all;
+----
+a	3
+b	5
+NULL	8
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%GROUP BY%';
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# UNION (distinct) legs do not split either
+statement ok con2
+create view projects_distinct as (select 'a' as site, * from local_site.projects) union (select 'b' as site, * from remote.remote_site.projects);
+
+query II con2
+select site, count(*) from projects_distinct group by site order by site;
+----
+a	3
+b	5
+
+# ---------------------------------------------------------------------------
+# More than two legs: every leg keeps its own slice.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+create schema other_site;
+
+statement ok con2
+create table other_site.projects(id int, org varchar, points int);
+
+statement ok con2
+insert into other_site.projects values (1, 'org_d', 7), (2, 'org_d', 9);
+
+statement ok con2
+create view projects_tri as
+    (select 'a' as site, * from local_site.projects)
+    union all (select 'b' as site, * from remote.remote_site.projects)
+    union all (select 'c' as site, * from other_site.projects);
+
+query III con2
+select site, count(*), sum(points) from projects_tri group by site order by site;
+----
+a	3	6
+b	5	150
+c	2	16
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
