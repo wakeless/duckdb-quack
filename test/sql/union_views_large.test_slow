@@ -112,6 +112,25 @@ select count(*) from (select id from events limit 5) t;
 ----
 5
 
+# ---------------------------------------------------------------------------
+# Re-executing a prepared statement re-runs the remote query: the bind-time
+# result was consumed by the first execution, so replaying its cached first
+# batch would silently drop the remaining batches.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+prepare events_total as select min(id), max(val), count(*) from (select site, id, val from events) t;
+
+query III con2
+execute events_total;
+----
+0	96	200000
+
+query III con2
+execute events_total;
+----
+0	96	200000
+
 statement ok con2
 detach remote;
 

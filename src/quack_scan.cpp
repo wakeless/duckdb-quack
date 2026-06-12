@@ -64,6 +64,7 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
 	bind_data->owns_pending_result = bind_data->needs_more_fetch;
+	bind_data->has_unconsumed_bind_result = true;
 
 	return bind_data;
 }
@@ -127,6 +128,7 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
 	bind_data->result_uuid = bind_response->ResultUUID();
 	bind_data->owns_pending_result = bind_data->needs_more_fetch;
+	bind_data->has_unconsumed_bind_result = true;
 	return bind_data;
 }
 
@@ -313,11 +315,18 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 	bool pushdown_applied = true;
 	hugeint_t result_uuid;
 	string query;
+	bool raw_replay = false;
 	if (!bind_data.table_name.empty()) {
 		// apply pushdown to the query
 		query = BuildPushdownQuery(bind_data, input);
 	} else {
 		query = BuildByNamePushdownQuery(bind_data, input);
+		if (query.empty() && !bind_data.has_unconsumed_bind_result) {
+			// the bind-time result was already consumed (a re-executed prepared statement)
+			// or never existed (a copied or rewritten bind data) - run the query again
+			query = bind_data.remote_query;
+			raw_replay = true;
+		}
 	}
 	if (!query.empty()) {
 		if (bind_data.table_name.empty() && bind_data.owns_pending_result) {
@@ -331,11 +340,34 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		auto &client = client_wrapper->GetClient();
 		auto response_message = client.Request<PrepareResponseMessage>(
 		    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query));
+		// the scan consumes chunks positionally; a server-side schema drift must fail loudly
+		// instead of mapping the wrong columns
+		vector<LogicalType> expected_types;
+		if (raw_replay) {
+			expected_types = bind_data.column_types;
+		} else {
+			for (auto &col_id : OutputColumns(input)) {
+				expected_types.push_back(col_id.IsVirtualColumn() ? LogicalType::BIGINT
+				                                                  : bind_data.column_types[col_id.GetPrimaryIndex()]);
+			}
+		}
+		if (response_message->Types() != expected_types) {
+			auto type_list = [](const vector<LogicalType> &types) {
+				return StringUtil::Join(types, types.size(), ", ",
+				                        [](const LogicalType &type) { return type.ToString(); });
+			};
+			throw InvalidInputException("quack scan: the server returned a result shaped (%s) for \"%s\", expected "
+			                            "(%s)",
+			                            type_list(response_message->Types()), query, type_list(expected_types));
+		}
+		pushdown_applied = !raw_replay;
 		needs_more_fetch = response_message->NeedsMoreFetch();
 		// fetch the result
+		auto chunk_pushdown_type =
+		    raw_replay ? ChunkResultPushdownType::REQUIRES_PUSHDOWN : ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
 		for (auto &chunk_ref : response_message->MutableResults()) {
 			auto &chunk = chunk_ref->Chunk();
-			results.emplace_back(chunk, ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED);
+			results.emplace_back(chunk, chunk_pushdown_type);
 		}
 		result_uuid = response_message->ResultUUID();
 	} else {
@@ -346,8 +378,10 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		}
 		result_uuid = bind_data.result_uuid;
 		// the scan takes over the bind-time result; its global state now closes it if the
-		// scan ends early
-		input.bind_data->CastNoConst<QuackScanBindData>().owns_pending_result = false;
+		// scan ends early, and any later execution of this bind data must re-PREPARE
+		auto &mutable_bind_data = input.bind_data->CastNoConst<QuackScanBindData>();
+		mutable_bind_data.owns_pending_result = false;
+		mutable_bind_data.has_unconsumed_bind_result = false;
 	}
 	// we only multithread if there is more to fetch
 	auto projection_ids = input.CanRemoveFilterColumns() ? input.projection_ids : vector<idx_t>();

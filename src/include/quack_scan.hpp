@@ -46,6 +46,11 @@ struct QuackScanBindData : FunctionData {
 	optional_ptr<TableCatalogEntry> table_entry;
 	bool needs_more_fetch = true;
 	hugeint_t result_uuid;
+	//! Whether the result PREPAREd at bind time is still available to stream. Deliberately not
+	//! copied, and cleared once a scan takes the result over: a later scan of the same bind data
+	//! (a re-executed prepared statement, a copied plan) must re-PREPARE instead of replaying
+	//! the cached first batch and silently losing the rest.
+	bool has_unconsumed_bind_result = false;
 	//! Whether this bind data is responsible for the server-side result it PREPAREd at bind
 	//! time; responsibility moves to the scan's global state once scanning starts.
 	//! Deliberately not copied: a copy never owns the original's pending result.
