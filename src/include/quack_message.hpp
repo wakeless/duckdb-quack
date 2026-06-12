@@ -121,13 +121,19 @@ class PrepareRequestMessage : public QuackMessage {
 public:
 	static constexpr MessageType TYPE = MessageType::PREPARE_REQUEST;
 
-	PrepareRequestMessage(string connection_id_p, string sql_query_p)
-	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)) {
+	PrepareRequestMessage(string connection_id_p, string sql_query_p, bool prepare_only_p = false)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)),
+	      prepare_only(prepare_only_p) {
 	}
 
 public:
 	const string &Query() const {
 		return sql_query;
+	}
+	//! When set, the server only binds the query to resolve its result schema; it does not
+	//! execute it and no pending result is created
+	bool PrepareOnly() const {
+		return prepare_only;
 	}
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareRequestMessage> Deserialize(Deserializer &deserializer);
@@ -138,6 +144,7 @@ protected:
 
 private:
 	string sql_query;
+	bool prepare_only = false;
 };
 
 class PrepareResponseMessage : public QuackMessage {

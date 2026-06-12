@@ -86,10 +86,37 @@ statement ok con2
 call disable_logging();
 
 # ---------------------------------------------------------------------------
-# A pending result abandoned before it is drained tells the server to drop it
-# instead of leaving it buffered. EXPLAIN binds the by-name scan (which
-# PREPAREs the result) but never scans it, so teardown must close it.
+# EXPLAIN of a union view binds the remote leg schema-only: nothing executes
+# on the server, so there is nothing to fetch and nothing to close. (A direct
+# remote reference goes through the statement-level rewrite instead, which
+# binds eagerly on purpose - its result doubles as the first batch.)
 # ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging('Quack');
+
+statement ok con2
+explain select * from events;
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type in ('FETCH_REQUEST', 'CLOSE_RESULT_REQUEST');
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
+# The eager path still cleans up after itself: EXPLAIN of a direct remote
+# reference goes through the statement-level rewrite, whose bind executes
+# eagerly; the abandoned result is closed instead of left buffered.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
 
 statement ok con2
 call enable_logging('Quack');
@@ -106,7 +133,7 @@ statement ok con2
 call disable_logging();
 
 # scans that end early (e.g. a LIMIT over the union view) still return correct
-# results; their abandoned results are closed the same way
+# results
 query I con2
 select count(*) from (select id from events limit 5) t;
 ----

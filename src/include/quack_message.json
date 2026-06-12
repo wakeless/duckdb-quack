@@ -49,6 +49,12 @@
         "id": 1,
         "name": "sql_query",
         "type": "string"
+      },
+      {
+        "id": 2,
+        "name": "prepare_only",
+        "type": "bool",
+        "default": "false"
       }
     ]
   },

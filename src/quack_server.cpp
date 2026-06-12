@@ -367,6 +367,27 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		connection.query_state = QuackQueryState::ACTIVE;
 		connection.query_started_at = Timestamp::GetCurrentTimestamp();
 
+		if (prepare_request_message.PrepareOnly()) {
+			// schema-only: bind the query to resolve its result schema without executing it;
+			// no pending result is created and there is nothing to fetch or close
+			auto prepared = connection.duckdb_connection->Prepare(effective_sql);
+			if (prepared->HasError()) {
+				connection.query_state = QuackQueryState::CANCELLED;
+				connection.sql_query = "";
+				return make_uniq<ErrorResponse>(prepared->GetErrorObject());
+			}
+			auto names = IdentifiersToStrings(prepared->GetNames());
+			auto types = prepared->GetTypes();
+			if (names.empty()) {
+				connection.query_state = QuackQueryState::CANCELLED;
+				connection.sql_query = "";
+				return make_uniq<ErrorResponse>("Query did not return any columns");
+			}
+			connection.query_state = QuackQueryState::FINISHED;
+			return make_uniq<PrepareResponseMessage>(types, names, vector<unique_ptr<DataChunkWrapper>>(),
+			                                         /*needs_more_fetch=*/false, hugeint_t(0));
+		}
+
 		// generate a random UUID to uniquely identify the result
 		auto result_uuid = UUID::GenerateRandomUUID();
 		{

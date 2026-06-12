@@ -123,11 +123,13 @@ MessageHeader MessageHeader::Deserialize(Deserializer &deserializer) {
 
 void PrepareRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "sql_query", sql_query);
+	serializer.WritePropertyWithDefault<bool>(2, "prepare_only", prepare_only, false);
 }
 
 unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserializer &deserializer) {
 	auto result = duckdb::unique_ptr<PrepareRequestMessage>(new PrepareRequestMessage());
 	deserializer.ReadPropertyWithDefault<string>(1, "sql_query", result->sql_query);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(2, "prepare_only", result->prepare_only, false);
 	return result;
 }
 
