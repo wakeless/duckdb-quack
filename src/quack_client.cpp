@@ -177,6 +177,36 @@ QuackClientConnection::~QuackClientConnection() {
 	}
 }
 
+QuackResultSchema QuackClientConnection::ResolveSchema(ClientContext &context, const string &query,
+                                                       int64_t ttl_seconds) const {
+	if (ttl_seconds > 0) {
+		lock_guard<mutex> guard(schema_cache_lock);
+		auto entry = schema_cache.find(query);
+		if (entry != schema_cache.end()) {
+			auto age = Timestamp::GetEpochSeconds(Timestamp::GetCurrentTimestamp()) -
+			           Timestamp::GetEpochSeconds(entry->second.resolved_at);
+			if (age <= ttl_seconds) {
+				return entry->second.schema;
+			}
+		}
+	}
+	// miss (or caching disabled): resolve the schema without executing the query
+	auto response = RequestWithReconnect<PrepareResponseMessage>(context, [&](const string &connection_id) {
+		return make_uniq<PrepareRequestMessage>(connection_id, query, /*prepare_only=*/true);
+	});
+	QuackResultSchema schema {response->Names(), response->Types()};
+	if (ttl_seconds > 0) {
+		lock_guard<mutex> guard(schema_cache_lock);
+		schema_cache[query] = CachedSchema {schema, Timestamp::GetCurrentTimestamp()};
+	}
+	return schema;
+}
+
+void QuackClientConnection::ClearSchemaCache() const {
+	lock_guard<mutex> guard(schema_cache_lock);
+	schema_cache.clear();
+}
+
 void QuackClientConnection::CloseResult(hugeint_t result_uuid) const noexcept {
 	try {
 		lock_guard<mutex> guard(lock);

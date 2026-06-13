@@ -98,6 +98,7 @@ shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection() {
 }
 
 void QuackCatalog::Refresh(ClientContext &context) {
+	client_connection->ClearSchemaCache();
 	auto load_info = LoadCatalog(context);
 	schemas->Reload(context, *this, load_info);
 }

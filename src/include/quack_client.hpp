@@ -8,11 +8,20 @@
 #include "quack_log.hpp"
 #include "quack_uri.hpp"
 
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/unordered_map.hpp"
+
 #include <functional>
 
 namespace duckdb {
 class QuackClientConnection;
 struct QuackClientWrapper;
+
+//! The resolved result schema of a remote query (the names and types its bind produces).
+struct QuackResultSchema {
+	vector<string> names;
+	vector<LogicalType> types;
+};
 
 class QuackClient {
 public:
@@ -101,6 +110,15 @@ public:
 		       error.ErrorMessage() == "Invalid connection id";
 	}
 
+	//! Resolve a remote query's result schema, reusing a cached result for the connection's
+	//! lifetime so repeated binds of the same query (e.g. a view referenced by many dashboard
+	//! queries) skip the cross-region round-trip. On a miss, resolves via a schema-only PREPARE
+	//! (reconnecting if the session was lost) and caches it. ttl_seconds bounds staleness;
+	//! ttl_seconds <= 0 disables the cache (always re-resolve, never store).
+	QuackResultSchema ResolveSchema(ClientContext &context, const string &query, int64_t ttl_seconds) const;
+	//! Drop all cached schemas (on catalog refresh, or when a cached schema is found stale).
+	void ClearSchemaCache() const;
+
 	//! Send a request built against the current connection id; when the server reports the
 	//! session is gone, re-handshake once and resend. Only safe for requests that do not
 	//! depend on server-side session state (a fresh PREPARE, a transaction-opening BEGIN);
@@ -139,6 +157,13 @@ private:
 	mutable mutex reconnect_lock;
 	mutable vector<unique_ptr<QuackClient>> cached_clients;
 	idx_t max_connections_cached;
+
+	struct CachedSchema {
+		QuackResultSchema schema;
+		timestamp_t resolved_at;
+	};
+	mutable mutex schema_cache_lock;
+	mutable unordered_map<string, CachedSchema> schema_cache;
 };
 
 class HttpsQuackClient : public QuackClient {

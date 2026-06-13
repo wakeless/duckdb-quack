@@ -1,4 +1,5 @@
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -31,26 +32,59 @@ static bool IsEagerBind(TableFunctionBindInput &input) {
 	return BooleanValue::Get(entry->second);
 }
 
-static void CaptureBindResponse(QuackScanBindData &bind_data, PrepareResponseMessage &response, const string &query,
-                                bool eager, vector<LogicalType> &return_types, vector<string> &names) {
+static int64_t GetSchemaCacheTtl(ClientContext &context) {
+	Value value;
+	if (DBConfig::GetConfig(context).TryGetCurrentSetting("quack_schema_cache_ttl", value) && !value.IsNull()) {
+		return value.GetValue<int64_t>();
+	}
+	return 0;
+}
+
+//! Fill bind data from a schema-only bind: nothing was executed, so there is no result to
+//! stream, own or close; the scan's init issues the (possibly rewritten) query as the only
+//! PREPARE.
+static void CaptureSchema(QuackScanBindData &bind_data, const QuackResultSchema &schema, const string &query,
+                          vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = schema.types;
+	names = schema.names;
+	bind_data.remote_query = query;
+	bind_data.column_names = schema.names;
+	bind_data.column_types = schema.types;
+	bind_data.needs_more_fetch = true;
+	bind_data.result_uuid = 0;
+	bind_data.owns_pending_result = false;
+	bind_data.has_unconsumed_bind_result = false;
+}
+
+//! Fill bind data from an eager bind: the PREPARE response doubles as the first result batch.
+static void CaptureEagerResponse(QuackScanBindData &bind_data, PrepareResponseMessage &response, const string &query,
+                                 vector<LogicalType> &return_types, vector<string> &names) {
 	return_types = response.Types();
 	names = response.Names();
 	bind_data.remote_query = query;
 	bind_data.column_names = names;
 	bind_data.column_types = return_types;
+	bind_data.results = std::move(response.MutableResults());
+	bind_data.needs_more_fetch = response.NeedsMoreFetch();
+	bind_data.result_uuid = response.ResultUUID();
+	bind_data.owns_pending_result = bind_data.needs_more_fetch;
+	bind_data.has_unconsumed_bind_result = true;
+}
+
+//! Resolve a remote query's schema for binding. Schema-only (view-leg) binds go through the
+//! connection's schema cache; eager binds execute and keep the first batch.
+static void BindRemoteQuery(QuackScanBindData &bind_data, ClientContext &context, const string &query, bool eager,
+                            vector<LogicalType> &return_types, vector<string> &names) {
+	auto &client_connection = *bind_data.client_connection;
 	if (eager) {
-		bind_data.results = std::move(response.MutableResults());
-		bind_data.needs_more_fetch = response.NeedsMoreFetch();
-		bind_data.result_uuid = response.ResultUUID();
-		bind_data.owns_pending_result = bind_data.needs_more_fetch;
-		bind_data.has_unconsumed_bind_result = true;
+		auto response = client_connection.RequestWithReconnect<PrepareResponseMessage>(
+		    context, [&](const string &connection_id) {
+			    return make_uniq<PrepareRequestMessage>(connection_id, query, /*prepare_only=*/false);
+		    });
+		CaptureEagerResponse(bind_data, *response, query, return_types, names);
 	} else {
-		// schema-only bind: nothing was executed, so there is no result to stream, own or
-		// close; the scan's init issues the (possibly rewritten) query as the only PREPARE
-		bind_data.needs_more_fetch = true;
-		bind_data.result_uuid = 0;
-		bind_data.owns_pending_result = false;
-		bind_data.has_unconsumed_bind_result = false;
+		auto schema = client_connection.ResolveSchema(context, query, GetSchemaCacheTtl(context));
+		CaptureSchema(bind_data, schema, query, return_types, names);
 	}
 }
 
@@ -83,14 +117,7 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 		token = input.named_parameters["token"].GetValue<string>();
 	}
 	bind_data->client_connection = QuackClient::ConnectToServer(context, server_uri, token);
-	auto &client_connection = *bind_data->client_connection;
-
-	auto eager = IsEagerBind(input);
-	auto bind_response =
-	    client_connection.RequestWithReconnect<PrepareResponseMessage>(context, [&](const string &connection_id) {
-		    return make_uniq<PrepareRequestMessage>(connection_id, query, /*prepare_only=*/!eager);
-	    });
-	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
+	BindRemoteQuery(*bind_data, context, query, IsEagerBind(input), return_types, names);
 
 	return bind_data;
 }
@@ -138,12 +165,7 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	auto query = input.inputs[1].GetValue<string>();
 	auto bind_data = make_uniq<QuackScanBindData>();
 	bind_data->client_connection = catalog.GetClientConnection();
-	auto eager = IsEagerBind(input);
-	auto bind_response = bind_data->client_connection->RequestWithReconnect<PrepareResponseMessage>(
-	    context, [&](const string &connection_id) {
-		    return make_uniq<PrepareRequestMessage>(connection_id, query, /*prepare_only=*/!eager);
-	    });
-	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
+	BindRemoteQuery(*bind_data, context, query, IsEagerBind(input), return_types, names);
 	return bind_data;
 }
 
@@ -367,6 +389,9 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 			}
 		}
 		if (response_message->Types() != expected_types) {
+			// a cached base schema may be stale (remote DDL); drop the cache so the next bind
+			// re-resolves and this query heals on retry
+			bind_data.client_connection->ClearSchemaCache();
 			auto type_list = [](const vector<LogicalType> &types) {
 				return StringUtil::Join(types, types.size(), ", ",
 				                        [](const LogicalType &type) { return type.ToString(); });
