@@ -22,7 +22,10 @@ void QuackTransaction::Start() {
 void QuackTransaction::ForceStart() {
 	if (transaction_state == QuackTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = QuackTransactionState::TRANSACTION_STARTED;
-		Query("BEGIN TRANSACTION");
+		// BEGIN opens the session-side transaction, so nothing is lost by re-handshaking when
+		// the server no longer knows the session; later statements (and COMMIT) must fail
+		// instead, since the server-side transaction state is gone
+		Query("BEGIN TRANSACTION", /*allow_reconnect=*/true);
 	}
 }
 
@@ -51,14 +54,14 @@ QuackTransaction &QuackTransaction::Get(CatalogTransaction transaction) {
 	return transaction.transaction->Cast<QuackTransaction>();
 }
 
-unique_ptr<ColumnDataCollection> QuackTransaction::Query(const string &query) {
+unique_ptr<ColumnDataCollection> QuackTransaction::Query(const string &query, bool allow_reconnect) {
 	ForceStart();
 	auto context_ref = context.lock();
 	if (!context_ref) {
 		// context has been destroyed - silently ignore the query
 		return nullptr;
 	}
-	return quack_catalog.ExecuteCommandInternal(*context_ref, query);
+	return quack_catalog.ExecuteCommandInternal(*context_ref, query, allow_reconnect);
 }
 
 } // namespace duckdb

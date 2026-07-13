@@ -18,6 +18,7 @@ enum class MessageType : uint8_t {
 	APPEND_REQUEST = 9,
 	SUCCESS_RESPONSE = 10,
 	DISCONNECT_MESSAGE = 11,
+	CLOSE_RESULT_REQUEST = 12,
 	ERROR_RESPONSE = 100
 };
 
@@ -120,13 +121,19 @@ class PrepareRequestMessage : public QuackMessage {
 public:
 	static constexpr MessageType TYPE = MessageType::PREPARE_REQUEST;
 
-	PrepareRequestMessage(string connection_id_p, string sql_query_p)
-	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)) {
+	PrepareRequestMessage(string connection_id_p, string sql_query_p, bool prepare_only_p = false)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)),
+	      prepare_only(prepare_only_p) {
 	}
 
 public:
 	const string &Query() const {
 		return sql_query;
+	}
+	//! When set, the server only binds the query to resolve its result schema; it does not
+	//! execute it and no pending result is created
+	bool PrepareOnly() const {
+		return prepare_only;
 	}
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareRequestMessage> Deserialize(Deserializer &deserializer);
@@ -137,6 +144,7 @@ protected:
 
 private:
 	string sql_query;
+	bool prepare_only = false;
 };
 
 class PrepareResponseMessage : public QuackMessage {
@@ -145,9 +153,10 @@ public:
 
 	PrepareResponseMessage(const vector<LogicalType> &types_p, const vector<string> &names_p,
 	                       vector<unique_ptr<DataChunkWrapper>> results_p, bool needs_more_fetch_p,
-	                       hugeint_t result_uuid)
+	                       hugeint_t result_uuid, idx_t estimated_cardinality_p = 0)
 	    : QuackMessage(TYPE), result_types(types_p), result_names(names_p), results(std::move(results_p)),
-	      needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid) {
+	      needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid),
+	      estimated_cardinality(estimated_cardinality_p) {
 	}
 
 public:
@@ -169,6 +178,10 @@ public:
 	hugeint_t ResultUUID() const {
 		return result_uuid;
 	}
+	//! The server plan's estimated row count; 0 when unknown (eager binds, older servers)
+	idx_t EstimatedCardinality() const {
+		return estimated_cardinality;
+	}
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareResponseMessage> Deserialize(Deserializer &deserializer);
@@ -183,6 +196,7 @@ private:
 	vector<unique_ptr<DataChunkWrapper>> results;
 	bool needs_more_fetch = false;
 	hugeint_t result_uuid;
+	idx_t estimated_cardinality = 0;
 };
 
 // TODO this is where auth goes
@@ -268,6 +282,28 @@ protected:
 public:
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<FetchRequestMessage> Deserialize(Deserializer &deserializer);
+
+	hugeint_t uuid;
+};
+
+//! Tells the server a pending result will not be fetched any further and can be dropped
+//! (e.g. the client stopped scanning early because of a LIMIT). Best-effort: closing an
+//! unknown or already-dropped result succeeds.
+class CloseResultRequestMessage : public QuackMessage {
+public:
+	static constexpr MessageType TYPE = MessageType::CLOSE_RESULT_REQUEST;
+
+	explicit CloseResultRequestMessage(string connection_id_p, hugeint_t uuid)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), uuid(uuid) {
+	}
+
+protected:
+	CloseResultRequestMessage() : QuackMessage(TYPE) {
+	}
+
+public:
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<CloseResultRequestMessage> Deserialize(Deserializer &deserializer);
 
 	hugeint_t uuid;
 };
@@ -372,6 +408,17 @@ public:
 	const string &ErrorMessage() const {
 		return error.Message();
 	}
+	//! Machine-readable error kind; empty for plain errors (and for messages from servers
+	//! that predate the field)
+	const string &ErrorCode() const {
+		return error_code;
+	}
+	void SetErrorCode(string code) {
+		error_code = std::move(code);
+	}
+
+	//! The connection id in the request is not (or no longer) known to the server
+	static constexpr const char *CONNECTION_NOT_FOUND = "CONNECTION_NOT_FOUND";
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<ErrorResponse> Deserialize(Deserializer &deserializer);
@@ -382,6 +429,7 @@ protected:
 
 private:
 	ErrorData error;
+	string error_code;
 };
 
 } // namespace duckdb

@@ -3,7 +3,6 @@ add_library(
   quack_catalog.cpp
   quack_catalog_set.cpp
   quack_insert.cpp
-  quack_optimizer.cpp
   quack_table.cpp
   quack_schema.cpp
   quack_transaction.cpp

@@ -10,7 +10,6 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/storage/storage_extension.hpp"
-#include "storage/quack_optimizer.hpp"
 
 #include "include/storage/quack_catalog.hpp"
 #include "quack_activity.hpp"
@@ -158,6 +157,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("quack_fetch_batch_chunks", "Maximum number of DataChunks returned per FETCH response",
 	                          LogicalType::UBIGINT, Value::UBIGINT(12));
 
+	config.AddExtensionOption("quack_join_pushdown",
+	                          "Allow joins between two scans of one server to execute on that server",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	config.AddExtensionOption("quack_assumed_scan_cardinality",
+	                          "Assumed row count for remote scans without a server estimate (0 disables)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+
 	// Process-wide fallback anchor for whoami().uptime when whoami_started_at isn't set.
 	// Stored as BIGINT epoch-microseconds to stay TZ-invariant regardless of ICU state.
 	config.AddExtensionOption("quack_loaded_at_us", "Epoch microseconds at extension load", LogicalType::BIGINT,
@@ -201,10 +208,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	};
 	auto whoami_info = DefaultTableFunctionGenerator::CreateTableMacroInfo(whoami_macro);
 	loader.RegisterFunction(*whoami_info);
-
-	OptimizerExtension quack_optimizer;
-	quack_optimizer.optimize_function = QuackOptimizer::Optimize;
-	OptimizerExtension::Register(config, std::move(quack_optimizer));
 }
 
 void QuackExtension::Load(ExtensionLoader &loader) {

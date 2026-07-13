@@ -25,30 +25,71 @@ EXPLAIN SELECT i, name FROM rpc.main.test_data;
 ----
 physical_plan	<REGEX>:.*Projections:.*i.*name.*
 
-# disabled for 1.5
-# # Verify filter pushdown appears in the physical plan
-# query II
-# EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = 42;
-# ----
-# physical_plan	<REGEX>:.*Filters:.*i=42.*
-#
-# # Verify range filter pushdown
-# query II
-# EXPLAIN SELECT i FROM rpc.main.test_data WHERE i > 9990;
-# ----
-# physical_plan	<REGEX>:.*Filters:.*i>9990.*
-#
-# # Verify multiple filters (AND)
-# query II
-# EXPLAIN SELECT i FROM rpc.main.test_data WHERE i >= 100 AND i < 200;
-# ----
-# physical_plan	<REGEX>:.*Filters:.*i>=100.*i<200.*
-#
-# # Verify combined filter + projection pushdown
-# query II
-# EXPLAIN SELECT name FROM rpc.main.test_data WHERE i = 100;
-# ----
-# physical_plan	<REGEX>:.*Projections:.*name.*
+# A pure-remote statement collapses wholesale at the statement level; the
+# filter travels inside the shipped SQL, so no FILTER operator remains.
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = 42;
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+# With the statement-level rewrite disabled, the filter is pushed into the
+# scan itself instead.
+statement ok
+set disabled_optimizers = 'remote_pushdown';
+
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = 42;
+----
+physical_plan	<REGEX>:.*Filters:.*i = 42.*
+
+# Verify range filter pushdown
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i > 9990;
+----
+physical_plan	<REGEX>:.*Filters:.*i > 9990.*
+
+# Verify multiple filters (AND)
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i >= 100 AND i < 200;
+----
+physical_plan	<REGEX>:.*Filters:.*i >= 100.*i < 200.*
+
+# Verify combined filter + projection pushdown
+query II
+EXPLAIN SELECT name FROM rpc.main.test_data WHERE i = 100;
+----
+physical_plan	<REGEX>:.*Projections:.*name.*
+
+# A pushed filter leaves no client-side FILTER operator above the scan
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = 42;
+----
+physical_plan	<!REGEX>:.*FILTER.*
+
+# A predicate over two columns ships whole into the remote WHERE clause
+query II
+EXPLAIN SELECT i FROM rpc.main.test_data WHERE i = doubled;
+----
+physical_plan	<REGEX>:.*Remote Filters:.*i = doubled.*
+
+query I
+select count(*) from rpc.main.test_data where i = doubled;
+----
+1
+
+# Correctness with the scan-level pushdown path
+query I
+select i from rpc.main.test_data where i = 42;
+----
+42
+
+query I
+select count(i) from rpc.main.test_data where i >= 100 and i < 200;
+----
+100
+
+statement ok
+set disabled_optimizers = '';
 
 # Correctness: filter pushdown returns correct results
 query I

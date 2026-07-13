@@ -8,6 +8,8 @@
 #include "quack_log.hpp"
 #include "quack_uri.hpp"
 
+#include <functional>
+
 namespace duckdb {
 class QuackClientConnection;
 struct QuackClientWrapper;
@@ -19,7 +21,7 @@ public:
 
 	template <class TARGET>
 	unique_ptr<TARGET> Request(optional_ptr<ClientContext> context, unique_ptr<QuackMessage> request_message) {
-		auto response_message = RequestInternal(context, std::move(request_message));
+		auto response_message = RawRequest(context, std::move(request_message));
 		if (response_message->Type() != TARGET::TYPE) {
 			if (response_message->Type() == MessageType::ERROR_RESPONSE) {
 				// if we get an error throw it immediately
@@ -29,6 +31,11 @@ public:
 			                  MessageTypeToString(response_message->Type()));
 		}
 		return unique_ptr_cast<QuackMessage, TARGET>(std::move(response_message));
+	}
+
+	//! Send a request and return the raw response, including error responses
+	unique_ptr<QuackMessage> RawRequest(optional_ptr<ClientContext> context, unique_ptr<QuackMessage> request_message) {
+		return RequestInternal(context, std::move(request_message));
 	}
 
 	static unique_ptr<QuackClient> GetClient(DatabaseInstance &db, const QuackUri &uri);
@@ -47,13 +54,25 @@ private:
 	                                                 unique_ptr<QuackMessage> request_message) = 0;
 };
 
+struct QuackClientWrapper {
+	QuackClientWrapper(unique_ptr<QuackClient> client, shared_ptr<const QuackClientConnection> client_connection);
+	~QuackClientWrapper();
+
+	QuackClient &GetClient();
+
+private:
+	unique_ptr<QuackClient> client;
+	shared_ptr<const QuackClientConnection> client_connection;
+};
+
 class QuackClientConnection : public enable_shared_from_this<QuackClientConnection> {
 public:
 	explicit QuackClientConnection(unique_ptr<QuackClient> client_p, QuackUri uri_p, string connection_id_p,
-	                               idx_t max_connections_cached = 1);
+	                               string token_p, idx_t max_connections_cached = 1);
 	~QuackClientConnection();
 
-	const string &ConnectionId() const {
+	string ConnectionId() const {
+		lock_guard<mutex> guard(lock);
 		return connection_id;
 	}
 	const QuackUri &ServerURI() const {
@@ -64,24 +83,62 @@ public:
 	unique_ptr<QuackClientWrapper> GetClient(ClientContext &context) const;
 	//! Return a client back to the cache
 	void StoreClient(unique_ptr<QuackClient> client_p) const;
+	//! Tell the server a pending result will not be fetched any further and can be dropped.
+	//! Best-effort and safe to call from destructors: never throws, and skips silently when
+	//! no cached client is available.
+	void CloseResult(hugeint_t result_uuid) const noexcept;
+
+	//! Re-establish the server session after the server forgot it (e.g. a restart). Returns
+	//! true when the connection now holds an id that differs from stale_connection_id -
+	//! either because this call performed the handshake or because another thread already
+	//! did. Reconnects are serialized; concurrent callers observe the refreshed id.
+	bool Reconnect(ClientContext &context, const string &stale_connection_id) const;
+
+	//! Whether an error response indicates the server no longer knows this session. Matches
+	//! the typed code, falling back to the message for servers that predate it.
+	static bool IsStaleSessionError(const ErrorResponse &error) {
+		return error.ErrorCode() == ErrorResponse::CONNECTION_NOT_FOUND ||
+		       error.ErrorMessage() == "Invalid connection id";
+	}
+
+	//! Send a request built against the current connection id; when the server reports the
+	//! session is gone, re-handshake once and resend. Only safe for requests that do not
+	//! depend on server-side session state (a fresh PREPARE, a transaction-opening BEGIN);
+	//! mid-result fetches, appends and commits must not go through this path.
+	template <class TARGET>
+	unique_ptr<TARGET>
+	RequestWithReconnect(ClientContext &context,
+	                     const std::function<unique_ptr<QuackMessage>(const string &)> &message) const {
+		for (idx_t attempt = 0;; attempt++) {
+			auto current_id = ConnectionId();
+			auto client_wrapper = GetClient(context);
+			auto &client = client_wrapper->GetClient();
+			auto response = client.RawRequest(context, message(current_id));
+			if (response->Type() == MessageType::ERROR_RESPONSE) {
+				auto &error = response->Cast<ErrorResponse>();
+				if (attempt == 0 && IsStaleSessionError(error) && Reconnect(context, current_id)) {
+					continue;
+				}
+				error.Error().Throw();
+			}
+			if (response->Type() != TARGET::TYPE) {
+				throw IOException("Expected %s message, got %s instead", MessageTypeToString(TARGET::TYPE),
+				                  MessageTypeToString(response->Type()));
+			}
+			return unique_ptr_cast<QuackMessage, TARGET>(std::move(response));
+		}
+	}
 
 private:
 	QuackUri uri;
-	string connection_id;
+	mutable string connection_id;
+	//! Retained for re-handshakes after a server restart
+	string token;
 	mutable mutex lock;
+	//! Serializes re-handshakes so a herd of failing requests performs one reconnect
+	mutable mutex reconnect_lock;
 	mutable vector<unique_ptr<QuackClient>> cached_clients;
 	idx_t max_connections_cached;
-};
-
-struct QuackClientWrapper {
-	QuackClientWrapper(unique_ptr<QuackClient> client, shared_ptr<const QuackClientConnection> client_connection);
-	~QuackClientWrapper();
-
-	QuackClient &GetClient();
-
-private:
-	unique_ptr<QuackClient> client;
-	shared_ptr<const QuackClientConnection> client_connection;
 };
 
 class HttpsQuackClient : public QuackClient {

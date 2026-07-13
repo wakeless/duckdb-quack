@@ -9,9 +9,12 @@ QuackViewCatalogEntry::QuackViewCatalogEntry(Catalog &catalog_p, SchemaCatalogEn
 
 string QuackViewCatalogEntry::CreateViewSQL(const string &catalog_name, const string &schema_name,
                                             const string &view_name) {
-	//! This SQL will always be "FROM quack_query({catalog}, 'FROM {view_name}');"
+	//! This SQL will always be "FROM quack_query_by_name({catalog}, 'FROM {view_name}', eager := false);"
+	//! View legs bind schema-only: pushdown routinely rewrites their query, which would
+	//! discard an eagerly executed bind-time result.
 	auto remote_sql = StringUtil::Format("FROM %s.%s", SQLIdentifier(schema_name), SQLIdentifier(view_name));
-	return StringUtil::Format("FROM quack_query_by_name(%s, %s)", SQLString(catalog_name), SQLString(remote_sql));
+	return StringUtil::Format("FROM quack_query_by_name(%s, %s, eager := false)", SQLString(catalog_name),
+	                          SQLString(remote_sql));
 }
 
 } // namespace duckdb

@@ -23,6 +23,16 @@ unique_ptr<AppendRequestMessage> AppendRequestMessage::Deserialize(Deserializer 
 	return result;
 }
 
+void CloseResultRequestMessage::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<hugeint_t>(1, "uuid", uuid);
+}
+
+unique_ptr<CloseResultRequestMessage> CloseResultRequestMessage::Deserialize(Deserializer &deserializer) {
+	auto result = duckdb::unique_ptr<CloseResultRequestMessage>(new CloseResultRequestMessage());
+	deserializer.ReadProperty<hugeint_t>(1, "uuid", result->uuid);
+	return result;
+}
+
 void ConnectionRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "auth_string", auth_string);
 	serializer.WritePropertyWithDefault<string>(2, "client_duckdb_version", client_duckdb_version);
@@ -65,11 +75,13 @@ unique_ptr<DisconnectMessage> DisconnectMessage::Deserialize(Deserializer &deser
 
 void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
+	serializer.WritePropertyWithDefault<string>(2, "error_code", error_code);
 }
 
 unique_ptr<ErrorResponse> ErrorResponse::Deserialize(Deserializer &deserializer) {
 	auto message = deserializer.ReadPropertyWithDefault<string>(1, "message");
 	auto result = duckdb::unique_ptr<ErrorResponse>(new ErrorResponse(std::move(message)));
+	deserializer.ReadPropertyWithDefault<string>(2, "error_code", result->error_code);
 	return result;
 }
 
@@ -111,11 +123,13 @@ MessageHeader MessageHeader::Deserialize(Deserializer &deserializer) {
 
 void PrepareRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "sql_query", sql_query);
+	serializer.WritePropertyWithDefault<bool>(2, "prepare_only", prepare_only, false);
 }
 
 unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserializer &deserializer) {
 	auto result = duckdb::unique_ptr<PrepareRequestMessage>(new PrepareRequestMessage());
 	deserializer.ReadPropertyWithDefault<string>(1, "sql_query", result->sql_query);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(2, "prepare_only", result->prepare_only, false);
 	return result;
 }
 
@@ -125,6 +139,7 @@ void PrepareResponseMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(3, "needs_more_fetch", needs_more_fetch);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results", results);
 	serializer.WriteProperty<hugeint_t>(5, "result_uuid", result_uuid);
+	serializer.WritePropertyWithDefault<idx_t>(6, "estimated_cardinality", estimated_cardinality, 0);
 }
 
 unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deserializer &deserializer) {
@@ -133,8 +148,11 @@ unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deseriali
 	auto needs_more_fetch = deserializer.ReadPropertyWithDefault<bool>(3, "needs_more_fetch");
 	auto results = deserializer.ReadPropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results");
 	auto result_uuid = deserializer.ReadProperty<hugeint_t>(5, "result_uuid");
-	auto result = duckdb::unique_ptr<PrepareResponseMessage>(new PrepareResponseMessage(
-	    std::move(result_types), std::move(result_names), std::move(results), needs_more_fetch, result_uuid));
+	idx_t estimated_cardinality = 0;
+	deserializer.ReadPropertyWithExplicitDefault<idx_t>(6, "estimated_cardinality", estimated_cardinality, 0);
+	auto result = duckdb::unique_ptr<PrepareResponseMessage>(
+	    new PrepareResponseMessage(std::move(result_types), std::move(result_names), std::move(results),
+	                               needs_more_fetch, result_uuid, estimated_cardinality));
 	return result;
 }
 

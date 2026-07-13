@@ -16,7 +16,11 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      # carries the aggregate/join-below-UNION-ALL splits and the
+      # pushdown_aggregate/pushdown_join table function hooks
+      # (proposed upstream; duckdb main + four commits)
+      override_duckdb_repository: https://github.com/wakeless/duckdb
+      duckdb_version: aggregate-union-pushdown
       ci_tools_version: main
       extension_name: quack
 

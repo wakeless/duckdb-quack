@@ -1,0 +1,390 @@
+# name: test/sql/union_views_join.test
+# description: joins over union views — the per-site sub-join runs inside the remote scan
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# ---------------------------------------------------------------------------
+# Server side: base tables exposed as views (opaque by-name scans client-side).
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.projects_base(id int, org varchar, points int);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.projects_base values
+    (1, 'org_a', 10),
+    (2, 'org_b', 20),
+    (3, 'org_a', 30),
+    (4, NULL, 40),
+    (5, 'internal', 50);
+
+statement ok quack_db:quack_server_con
+create table remote_site.memberships_base(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.memberships_base values
+    (1, 'org_a', 101, 'member', 'false'),
+    (1, 'org_a', 102, 'member', NULL),
+    (1, 'org_a', 103, 'member', 'true'),
+    (1, 'org_a', 104, 'admin', 'false'),
+    (2, 'org_b', 201, 'member', 'false'),
+    (3, 'org_a', 301, 'member', 'false'),
+    (NULL, 'org_b', 999, 'member', 'false');
+
+statement ok quack_db:quack_server_con
+create table remote_site.tags_base(project_id int, tag varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.tags_base values (1, 'x'), (2, 'y');
+
+statement ok quack_db:quack_server_con
+create view remote_site.projects as from remote_site.projects_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.memberships as from remote_site.memberships_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.tags as from remote_site.tags_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.projects(id int, org varchar, points int);
+
+statement ok con2
+insert into local_site.projects values
+    (1, 'org_a', 1),
+    (2, 'org_c', 2),
+    (3, 'internal', 3);
+
+statement ok con2
+create table local_site.memberships(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok con2
+insert into local_site.memberships values
+    (1, 'org_a', 11, 'member', 'false'),
+    (1, 'org_a', 12, 'member', 'false'),
+    (2, 'org_c', 21, 'member', NULL),
+    (2, 'org_c', 22, 'member', 'true'),
+    (1, 'org_a', 13, 'admin', NULL),
+    (NULL, 'org_c', 99, 'member', 'false');
+
+statement ok con2
+create table local_site.tags(project_id int, tag varchar);
+
+statement ok con2
+insert into local_site.tags values (1, 'p'), (3, 'q');
+
+statement ok con2
+create view projects as (select 'a' as site, * from local_site.projects) union all (select 'b' as site, * from remote.remote_site.projects);
+
+statement ok con2
+create view memberships as (select 'a' as site, * from local_site.memberships) union all (select 'b' as site, * from remote.remote_site.memberships);
+
+statement ok con2
+create view tags as (select 'a' as site, * from local_site.tags) union all (select 'b' as site, * from remote.remote_site.tags);
+
+# ---------------------------------------------------------------------------
+# Correctness twins: these answers must never change, pushed down or not.
+# The site tag is in every join key, so sites never mix.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call enable_logging('Quack');
+
+# inner join on (site, id)
+query III con2
+select p.site, p.id, m.user_id
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id
+order by p.site, p.id, m.user_id;
+----
+a	1	11
+a	1	12
+a	1	13
+a	2	21
+a	2	22
+b	1	101
+b	1	102
+b	1	103
+b	1	104
+b	2	201
+b	3	301
+
+# the remote (site b) sub-join shipped whole: a JOIN appears in the prepared SQL
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%JOIN%';
+----
+true
+
+# ...and EXPLAIN shows the joined remote query on a single quack scan
+query II con2
+explain select p.site, p.id, m.user_id
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id;
+----
+physical_plan	<REGEX>:.*Remote Query.*JOIN.*
+
+# left join keeps memberless projects, NULL-padded within their site
+query III con2
+select p.site, p.id, m.user_id
+from projects p
+left join memberships m on m.site = p.site and m.project_id = p.id
+order by p.site, p.id, m.user_id;
+----
+a	1	11
+a	1	12
+a	1	13
+a	2	21
+a	2	22
+a	3	NULL
+b	1	101
+b	1	102
+b	1	103
+b	1	104
+b	2	201
+b	3	301
+b	4	NULL
+b	5	NULL
+
+# a filter on one side applies before the join
+query III con2
+select p.site, p.id, count(*)
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id
+where m.role = 'member'
+group by p.site, p.id
+order by p.site, p.id;
+----
+a	1	2
+a	2	2
+b	1	3
+b	2	1
+b	3	1
+
+# self-join: both sides carry the same column names
+query IIII con2
+select p.site, p.id, p.points, q.points
+from projects p
+join projects q on q.site = p.site and q.id = p.id
+order by p.site, p.id;
+----
+a	1	1	1
+a	2	2	2
+a	3	3	3
+b	1	10	10
+b	2	20	20
+b	3	30	30
+b	4	40	40
+b	5	50	50
+
+# three views: the per-site sub-join spans all three
+query IIII con2
+select p.site, p.id, m.user_id, t.tag
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id
+join tags t on t.site = p.site and t.project_id = p.id
+order by p.site, p.id, m.user_id;
+----
+a	1	11	p
+a	1	12	p
+a	1	13	p
+b	1	101	x
+b	1	102	x
+b	1	103	x
+b	1	104	x
+b	2	201	y
+
+# three-view case collapses iteratively: a nested JOIN ships in one query
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%JOIN%JOIN%';
+----
+true
+
+# aggregate over the join: per-site counts
+query II con2
+select p.site, count(*)
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id
+group by p.site
+order by p.site;
+----
+a	5
+b	6
+
+# the site-grouped aggregate folds on top of the folded join
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%JOIN%GROUP BY%';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# repeated execution of a prepared join returns identical results
+statement ok con2
+prepare join_stmt as
+select p.site, p.id, count(*)
+from projects p
+join memberships m on m.site = p.site and m.project_id = p.id
+group by p.site, p.id
+order by p.site, p.id;
+
+query III con2
+execute join_stmt;
+----
+a	1	3
+a	2	2
+b	1	4
+b	2	1
+b	3	1
+
+query III con2
+execute join_stmt;
+----
+a	1	3
+a	2	2
+b	1	4
+b	2	1
+b	3	1
+
+# ---------------------------------------------------------------------------
+# Shapes that must NOT decompose: results stay correct and no JOIN ships.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging('Quack');
+
+# no site equality in the join: sites mix, cross-leg matches are real
+query I con2
+select count(*)
+from projects p
+join memberships m on m.project_id = p.id;
+----
+22
+
+# UNION (distinct) legs do not decompose
+statement ok con2
+create view projects_distinct as (select 'a' as site, * from local_site.projects) union (select 'b' as site, * from remote.remote_site.projects);
+
+query I con2
+select count(*)
+from projects_distinct p
+join memberships m on m.site = p.site and m.project_id = p.id;
+----
+11
+
+# mismatched tag sets: a three-legged view joined to a two-legged view
+statement ok con2
+create schema other_site;
+
+statement ok con2
+create table other_site.projects(id int, org varchar, points int);
+
+statement ok con2
+insert into other_site.projects values (1, 'org_d', 7), (2, 'org_d', 9);
+
+statement ok con2
+create view projects_tri as
+    (select 'a' as site, * from local_site.projects)
+    union all (select 'b' as site, * from remote.remote_site.projects)
+    union all (select 'c' as site, * from other_site.projects);
+
+query I con2
+select count(*)
+from projects_tri p
+join memberships m on m.site = p.site and m.project_id = p.id;
+----
+11
+
+# none of the above shipped a JOIN
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%JOIN%';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Opt-outs: correct results and nothing ships.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+set quack_join_pushdown = false;
+
+query I con2
+select count(*) from projects p join memberships m on m.site = p.site and m.project_id = p.id;
+----
+11
+
+statement ok con2
+set quack_join_pushdown = true;
+
+statement ok con2
+set disabled_optimizers = 'join_union_pushdown';
+
+query I con2
+select count(*) from projects p join memberships m on m.site = p.site and m.project_id = p.id;
+----
+11
+
+statement ok con2
+set disabled_optimizers = '';
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%JOIN%';
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
+# Per-attachment opt-out, with the bail reason logged for diagnosis.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+attach {server} as remote_nopush (token 'asdf', join_pushdown false);
+
+statement ok con2
+create view projects_nopush as (select 'a' as site, * from local_site.projects) union all (select 'b' as site, * from remote_nopush.remote_site.projects);
+
+statement ok con2
+create view memberships_nopush as (select 'a' as site, * from local_site.memberships) union all (select 'b' as site, * from remote_nopush.remote_site.memberships);
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging();
+
+query I con2
+select count(*) from projects_nopush p join memberships_nopush m on m.site = p.site and m.project_id = p.id;
+----
+11
+
+# the scan declined and said why
+query I con2
+select count(*) > 0 from duckdb_logs where message like '%join pushdown%';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+statement ok con2
+detach remote_nopush;
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template

@@ -137,10 +137,33 @@ unique_ptr<QuackClient> QuackClient::GetClient(ClientContext &context, const Qua
 }
 
 QuackClientConnection::QuackClientConnection(unique_ptr<QuackClient> client_p, QuackUri uri_p, string connection_id_p,
-                                             idx_t max_connections_cached)
-    : uri(std::move(uri_p)), connection_id(std::move(connection_id_p)), max_connections_cached(max_connections_cached) {
+                                             string token_p, idx_t max_connections_cached)
+    : uri(std::move(uri_p)), connection_id(std::move(connection_id_p)), token(std::move(token_p)),
+      max_connections_cached(max_connections_cached) {
 	if (client_p) {
 		StoreClient(std::move(client_p));
+	}
+}
+
+bool QuackClientConnection::Reconnect(ClientContext &context, const string &stale_connection_id) const {
+	// one re-handshake at a time: the first failing request reconnects, concurrent ones then
+	// observe the refreshed id and simply retry against it
+	lock_guard<mutex> reconnect_guard(reconnect_lock);
+	{
+		lock_guard<mutex> guard(lock);
+		if (connection_id != stale_connection_id) {
+			return true;
+		}
+	}
+	try {
+		auto client = QuackClient::GetClient(context, uri);
+		auto response = client->Request<ConnectionResponseMessage>(context, make_uniq<ConnectionRequestMessage>(token));
+		lock_guard<mutex> guard(lock);
+		connection_id = response->ConnectionId();
+		return true;
+	} catch (...) {
+		// the server is unreachable or rejected the handshake - surface the original error
+		return false;
 	}
 }
 
@@ -151,6 +174,19 @@ QuackClientConnection::~QuackClientConnection() {
 			client->Request<SuccessResponse>(nullptr, make_uniq<DisconnectMessage>(connection_id));
 		} catch (...) {
 		}
+	}
+}
+
+void QuackClientConnection::CloseResult(hugeint_t result_uuid) const noexcept {
+	try {
+		lock_guard<mutex> guard(lock);
+		if (cached_clients.empty()) {
+			// no client to send with - the server drops the result on disconnect
+			return;
+		}
+		auto &client = cached_clients.back();
+		client->Request<SuccessResponse>(nullptr, make_uniq<CloseResultRequestMessage>(connection_id, result_uuid));
+	} catch (...) {
 	}
 }
 
@@ -177,9 +213,10 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	auto connection_request_response =
 	    client->Request<ConnectionResponseMessage>(context, make_uniq<ConnectionRequestMessage>(token));
 	// success! we got a connection id
-	// construct the client connection and return it
+	// construct the client connection and return it; the token is retained so the session can
+	// be re-established when the server forgets it (e.g. across a server restart)
 	auto connection_id = connection_request_response->ConnectionId();
-	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id));
+	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id), std::move(token));
 }
 
 unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &context) const {
