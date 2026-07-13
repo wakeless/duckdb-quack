@@ -80,6 +80,7 @@ TableFunction QuackTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	auto &quack_catalog = catalog.Cast<QuackCatalog>();
 	auto bind_data = make_uniq<QuackScanBindData>();
 	bind_data->client_connection = quack_catalog.GetClientConnection();
+	bind_data->join_pushdown_enabled = quack_catalog.JoinPushdownEnabled();
 	bind_data->table_name = name.GetIdentifierName();
 	for (auto &col : GetColumns().Physical()) {
 		bind_data->column_names.push_back(col.Name().GetIdentifierName());

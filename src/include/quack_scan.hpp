@@ -30,6 +30,8 @@ struct QuackScanBindData : FunctionData {
 		result->remote_filters = remote_filters;
 		result->column_names = column_names;
 		result->column_types = column_types;
+		result->join_pushdown_enabled = join_pushdown_enabled;
+		result->remote_query_rewritten = remote_query_rewritten;
 		return std::move(result);
 	}
 
@@ -55,6 +57,11 @@ struct QuackScanBindData : FunctionData {
 	//! time; responsibility moves to the scan's global state once scanning starts.
 	//! Deliberately not copied: a copy never owns the original's pending result.
 	bool owns_pending_result = false;
+	//! Whether this scan may absorb joins (the attachment's JOIN_PUSHDOWN option)
+	bool join_pushdown_enabled = true;
+	//! Whether remote_query was rewritten by an absorbed aggregate/join (shown in EXPLAIN;
+	//! the raw bind-time query of an untouched scan is not)
+	bool remote_query_rewritten = false;
 };
 
 class TableFunction;

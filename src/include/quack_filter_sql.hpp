@@ -23,9 +23,11 @@ bool IsDeparseSafe(const Expression &expr);
 
 //! Render a filter expression whose column references still point at the scan's projection
 //! list (as handed to pushdown_complex_filter) as SQL. Returns an empty string when the
-//! expression cannot be rendered; the caller then leaves the filter in the plan.
+//! expression cannot be rendered; the caller then leaves the filter in the plan. A non-empty
+//! qualifier prefixes every column reference (e.g. t0."col") for multi-relation contexts.
 string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &column_ids,
-                           const vector<string> &column_names, const vector<LogicalType> &column_types);
+                           const vector<string> &column_names, const vector<LogicalType> &column_types,
+                           const string &qualifier = string());
 
 //! Render an aggregate call (column references as above) as SQL, e.g. "count(*)" or
 //! "sum(DISTINCT \"val\")". Returns an empty string when the call cannot be reproduced.

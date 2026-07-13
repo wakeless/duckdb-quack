@@ -124,7 +124,8 @@ static void RenderFilterExpression(unique_ptr<Expression> expr, vector<string> &
 }
 
 string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &column_ids,
-                           const vector<string> &column_names, const vector<LogicalType> &column_types) {
+                           const vector<string> &column_names, const vector<LogicalType> &column_types,
+                           const string &qualifier) {
 	auto copy = expr.Copy();
 	// rewrite each column reference into a name-carrying node the server understands
 	bool resolved = true;
@@ -141,8 +142,12 @@ string RenderComplexFilter(const Expression &expr, const vector<ColumnIndex> &co
 			    return;
 		    }
 		    auto col_id = col_index.GetPrimaryIndex();
-		    node = make_uniq<BoundReferenceExpression>(Identifier(SQLIdentifier::ToString(column_names[col_id])),
-		                                               column_types[col_id], 0ULL);
+		    auto rendered_name = SQLIdentifier::ToString(column_names[col_id]);
+		    if (!qualifier.empty()) {
+			    rendered_name = qualifier + "." + rendered_name;
+		    }
+		    node = make_uniq<BoundReferenceExpression>(Identifier(std::move(rendered_name)), column_types[col_id],
+		                                               0ULL);
 	    });
 	if (!resolved || !IsDeparseSafe(*copy)) {
 		return string();

@@ -21,7 +21,7 @@ class QuackClientConnection;
 class QuackCatalog : public Catalog {
 public:
 	explicit QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri_p, ClientContext &context,
-	                      const string &token);
+	                      const string &token, bool join_pushdown_enabled = true);
 	~QuackCatalog() override;
 
 public:
@@ -74,6 +74,11 @@ public:
 
 	shared_ptr<QuackClientConnection> GetClientConnection();
 
+	//! Whether joins may be shipped to this attachment's server (the JOIN_PUSHDOWN option)
+	bool JoinPushdownEnabled() const {
+		return join_pushdown_enabled;
+	}
+
 	void Refresh(ClientContext &context);
 
 private:
@@ -84,6 +89,7 @@ private:
 private:
 	shared_ptr<QuackClientConnection> client_connection;
 	unique_ptr<QuackSchemaSet> schemas;
+	bool join_pushdown_enabled = true;
 };
 
 } // namespace duckdb

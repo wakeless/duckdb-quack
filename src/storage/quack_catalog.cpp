@@ -24,8 +24,8 @@
 namespace duckdb {
 
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
-                           const string &token)
-    : Catalog(db_p) {
+                           const string &token, bool join_pushdown_enabled_p)
+    : Catalog(db_p), join_pushdown_enabled(join_pushdown_enabled_p) {
 	// connect to the server
 	client_connection = QuackClient::ConnectToServer(context, server_uri, token);
 
