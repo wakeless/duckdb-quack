@@ -32,6 +32,7 @@ struct QuackScanBindData : FunctionData {
 		result->column_types = column_types;
 		result->join_pushdown_enabled = join_pushdown_enabled;
 		result->remote_query_rewritten = remote_query_rewritten;
+		result->estimated_cardinality = estimated_cardinality;
 		return std::move(result);
 	}
 
@@ -62,6 +63,8 @@ struct QuackScanBindData : FunctionData {
 	//! Whether remote_query was rewritten by an absorbed aggregate/join (shown in EXPLAIN;
 	//! the raw bind-time query of an untouched scan is not)
 	bool remote_query_rewritten = false;
+	//! The server plan's estimated row count from the schema-only PREPARE; 0 when unknown
+	idx_t estimated_cardinality = 0;
 };
 
 class TableFunction;

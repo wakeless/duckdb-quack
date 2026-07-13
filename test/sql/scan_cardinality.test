@@ -1,0 +1,65 @@
+# name: test/sql/scan_cardinality.test
+# description: quack scans report the server's row estimate instead of the 1-row default
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.projects_base(id int, org varchar, points int);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.projects_base values
+    (1, 'org_a', 10),
+    (2, 'org_b', 20),
+    (3, 'org_a', 30),
+    (4, NULL, 40),
+    (5, 'internal', 50);
+
+statement ok quack_db:quack_server_con
+create view remote_site.projects as from remote_site.projects_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create table local_projects(id int, org varchar, points int);
+
+statement ok con2
+insert into local_projects values (1, 'org_a', 1);
+
+statement ok con2
+create view projects as (select 'a' as site, * from local_projects) union all (select 'b' as site, * from remote.remote_site.projects);
+
+# a mixed statement binds the remote leg schema-only, which carries the server plan's row
+# estimate (5) - not the 1-row default that mis-sides joins
+query II con2
+explain select * from projects;
+----
+physical_plan	<REGEX>:.*QUACK_QUERY_BY_NAME.*~5 [Rr]ows.*
+
+# a pure-remote statement ships whole and executes eagerly at bind: no server estimate exists,
+# so the configured assumption applies instead
+statement ok con2
+set quack_assumed_scan_cardinality = 12345;
+
+query II con2
+explain select * from remote.remote_site.projects;
+----
+physical_plan	<REGEX>:.*QUACK_QUERY_BY_NAME.*~12,345 [Rr]ows.*
+
+# 0 disables the assumption (back to the engine default)
+statement ok con2
+set quack_assumed_scan_cardinality = 0;
+
+query II con2
+explain select * from remote.remote_site.projects;
+----
+physical_plan	<REGEX>:.*QUACK_QUERY_BY_NAME.*~1 [Rr]ows?.*
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template

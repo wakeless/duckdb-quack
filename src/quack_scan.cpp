@@ -39,6 +39,7 @@ static void CaptureBindResponse(QuackScanBindData &bind_data, PrepareResponseMes
 	bind_data.remote_query = query;
 	bind_data.column_names = names;
 	bind_data.column_types = return_types;
+	bind_data.estimated_cardinality = response.EstimatedCardinality();
 	if (eager) {
 		bind_data.results = std::move(response.MutableResults());
 		bind_data.needs_more_fetch = response.NeedsMoreFetch();
@@ -748,6 +749,26 @@ static bool QuackScanPushdownJoin(ClientContext &context, LogicalGet &left_get, 
 	return true;
 }
 
+static unique_ptr<NodeStatistics> QuackScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	if (!bind_data_p) {
+		return nullptr;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	if (bind_data.estimated_cardinality > 0) {
+		return make_uniq<NodeStatistics>(bind_data.estimated_cardinality);
+	}
+	// no server estimate (eager binds, older servers): assume the configured cardinality so
+	// the optimizer does not size the remote relation at the 1-row default
+	Value assumed;
+	if (context.TryGetCurrentSetting("quack_assumed_scan_cardinality", assumed)) {
+		auto value = assumed.GetValue<uint64_t>();
+		if (value > 0) {
+			return make_uniq<NodeStatistics>(value);
+		}
+	}
+	return nullptr;
+}
+
 static bool QuackScanPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
 	// anything accepted here becomes a required filter the scan must enforce, so acceptance
 	// has to equal serializability
@@ -843,6 +864,7 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
 	fun.pushdown_aggregate = QuackScanPushdownAggregate;
 	fun.pushdown_join = QuackScanPushdownJoin;
+	fun.cardinality = QuackScanCardinality;
 	return fun;
 }
 
@@ -863,6 +885,7 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
 	fun.pushdown_aggregate = QuackScanPushdownAggregate;
 	fun.pushdown_join = QuackScanPushdownJoin;
+	fun.cardinality = QuackScanCardinality;
 	return fun;
 }
 

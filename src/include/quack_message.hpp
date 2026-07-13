@@ -153,9 +153,10 @@ public:
 
 	PrepareResponseMessage(const vector<LogicalType> &types_p, const vector<string> &names_p,
 	                       vector<unique_ptr<DataChunkWrapper>> results_p, bool needs_more_fetch_p,
-	                       hugeint_t result_uuid)
+	                       hugeint_t result_uuid, idx_t estimated_cardinality_p = 0)
 	    : QuackMessage(TYPE), result_types(types_p), result_names(names_p), results(std::move(results_p)),
-	      needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid) {
+	      needs_more_fetch(needs_more_fetch_p), result_uuid(result_uuid),
+	      estimated_cardinality(estimated_cardinality_p) {
 	}
 
 public:
@@ -177,6 +178,10 @@ public:
 	hugeint_t ResultUUID() const {
 		return result_uuid;
 	}
+	//! The server plan's estimated row count; 0 when unknown (eager binds, older servers)
+	idx_t EstimatedCardinality() const {
+		return estimated_cardinality;
+	}
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareResponseMessage> Deserialize(Deserializer &deserializer);
@@ -191,6 +196,7 @@ private:
 	vector<unique_ptr<DataChunkWrapper>> results;
 	bool needs_more_fetch = false;
 	hugeint_t result_uuid;
+	idx_t estimated_cardinality = 0;
 };
 
 // TODO this is where auth goes

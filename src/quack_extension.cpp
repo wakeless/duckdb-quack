@@ -161,6 +161,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Allow joins between two scans of one server to execute on that server",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
+	config.AddExtensionOption("quack_assumed_scan_cardinality",
+	                          "Assumed row count for remote scans without a server estimate (0 disables)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+
 	// Process-wide fallback anchor for whoami().uptime when whoami_started_at isn't set.
 	// Stored as BIGINT epoch-microseconds to stay TZ-invariant regardless of ICU state.
 	config.AddExtensionOption("quack_loaded_at_us", "Epoch microseconds at extension load", LogicalType::BIGINT,

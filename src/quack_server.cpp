@@ -5,6 +5,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/temporary_file_manager.hpp"
@@ -383,9 +385,13 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 				connection.sql_query = "";
 				return make_uniq<ErrorResponse>("Query did not return any columns");
 			}
+			idx_t estimated_cardinality = 0;
+			if (prepared->data && prepared->data->physical_plan) {
+				estimated_cardinality = prepared->data->physical_plan->Root().estimated_cardinality;
+			}
 			connection.query_state = QuackQueryState::FINISHED;
 			return make_uniq<PrepareResponseMessage>(types, names, vector<unique_ptr<DataChunkWrapper>>(),
-			                                         /*needs_more_fetch=*/false, hugeint_t(0));
+			                                         /*needs_more_fetch=*/false, hugeint_t(0), estimated_cardinality);
 		}
 
 		// generate a random UUID to uniquely identify the result

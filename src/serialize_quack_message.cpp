@@ -139,6 +139,7 @@ void PrepareResponseMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(3, "needs_more_fetch", needs_more_fetch);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results", results);
 	serializer.WriteProperty<hugeint_t>(5, "result_uuid", result_uuid);
+	serializer.WritePropertyWithDefault<idx_t>(6, "estimated_cardinality", estimated_cardinality, 0);
 }
 
 unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deserializer &deserializer) {
@@ -147,8 +148,11 @@ unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deseriali
 	auto needs_more_fetch = deserializer.ReadPropertyWithDefault<bool>(3, "needs_more_fetch");
 	auto results = deserializer.ReadPropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results");
 	auto result_uuid = deserializer.ReadProperty<hugeint_t>(5, "result_uuid");
-	auto result = duckdb::unique_ptr<PrepareResponseMessage>(new PrepareResponseMessage(
-	    std::move(result_types), std::move(result_names), std::move(results), needs_more_fetch, result_uuid));
+	idx_t estimated_cardinality = 0;
+	deserializer.ReadPropertyWithExplicitDefault<idx_t>(6, "estimated_cardinality", estimated_cardinality, 0);
+	auto result = duckdb::unique_ptr<PrepareResponseMessage>(
+	    new PrepareResponseMessage(std::move(result_types), std::move(result_names), std::move(results),
+	                               needs_more_fetch, result_uuid, estimated_cardinality));
 	return result;
 }
 
