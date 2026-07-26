@@ -150,6 +150,20 @@ QuackServer::QuackServer(ClientContext &context_p, const QuackUri &uri_p, const 
 QuackServer::~QuackServer() {
 }
 
+void QuackServer::RecordRequest(int connection_key) {
+	// httplib hands a keep-alive connection to one worker thread and keeps it there until the
+	// connection closes, so a key that differs from the last one seen on this thread means a
+	// fresh connection was accepted. A new connection that happens to reuse the previous
+	// connection's ephemeral port *and* lands on the same worker is undercounted; that is
+	// acceptable for a reuse indicator, and costs nothing to maintain.
+	static thread_local int last_connection_key = -1;
+	if (connection_key != last_connection_key) {
+		last_connection_key = connection_key;
+		client_connection_count++;
+	}
+	request_count++;
+}
+
 vector<QuackConnectionSnapshot> QuackServer::GetActiveConnectionSnap() {
 	vector<QuackConnectionSnapshot> result;
 	std::lock_guard<std::mutex> lock(active_connections_mutex);

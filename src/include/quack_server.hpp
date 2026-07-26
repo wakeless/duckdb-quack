@@ -140,7 +140,21 @@ public:
 		return active_connections.size();
 	}
 
+	//! Number of client requests this server has served
+	idx_t RequestCount() const {
+		return request_count;
+	}
+	//! Number of client transport connections this server has accepted. Compared against
+	//! RequestCount() this shows whether clients hold their connections open across requests.
+	idx_t ClientConnectionCount() const {
+		return client_connection_count;
+	}
+
 protected:
+	//! Account for a request arriving over the client transport connection identified by
+	//! `connection_key` (for HTTP, the client's remote port).
+	void RecordRequest(int connection_key);
+
 	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream);
 	unique_ptr<QuackMessage> HandleMessageInternal(DatabaseInstance &db, QuackMessage &received_message,
 	                                               optional_ptr<QuackConnection> connection);
@@ -154,6 +168,9 @@ protected:
 
 	mutex session_id_rng_mutex;
 	shared_ptr<EncryptionState> session_id_rng;
+
+	atomic<idx_t> request_count {0};
+	atomic<idx_t> client_connection_count {0};
 
 	QuackUri uri;
 
