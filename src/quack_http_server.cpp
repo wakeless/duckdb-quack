@@ -247,8 +247,9 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 		res.status = 204;
 	});
 
-	server->Post("/quack", [&](const duckdb_httplib_openssl::Request &, duckdb_httplib_openssl::Response &res,
+	server->Post("/quack", [&](const duckdb_httplib_openssl::Request &req, duckdb_httplib_openssl::Response &res,
 	                           const duckdb_httplib_openssl::ContentReader &content_reader) {
+		RecordRequest(req.remote_port);
 		res.set_header("Access-Control-Allow-Origin", "*");
 		MemoryStream stream;
 		content_reader([&](const char *data, size_t data_length) {

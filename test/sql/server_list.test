@@ -30,6 +30,27 @@ SELECT info['ipv6'] FROM quack_server_list();
 ----
 false
 
+# a server that has never been talked to has served nothing
+query II quack_db:quack_server_con
+SELECT info['client_connections'], info['client_requests'] FROM quack_server_list();
+----
+0	0
+
+statement ok
+create secret (type quack, token 'asdf')
+
+query I
+from quack_query({server}, 'select 42')
+----
+42
+
+# the counters moved: a request was served over a client connection
+query II quack_db:quack_server_con
+SELECT info['client_requests']::BIGINT > 0, info['client_connections']::BIGINT > 0
+FROM quack_server_list();
+----
+true	true
+
 # add a second server, verify count and ordering-agnostic content
 statement ok quack_db:quack_server_con
 FROM quack_serve('quack:127.0.0.1:9495', token='abcd');

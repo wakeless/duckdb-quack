@@ -55,6 +55,8 @@ vector<QuackStorageExtensionInfo::ServerSnapshot> QuackStorageExtensionInfo::Lis
 		if (uri.Ssl()) {
 			snap.info.emplace_back("ssl_fingerprint", kv.second->SslFingerprint());
 		}
+		snap.info.emplace_back("client_connections", std::to_string(kv.second->ClientConnectionCount()));
+		snap.info.emplace_back("client_requests", std::to_string(kv.second->RequestCount()));
 		result.push_back(std::move(snap));
 	}
 	return result;

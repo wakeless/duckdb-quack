@@ -170,7 +170,21 @@ public:
 		return active_connections.size();
 	}
 
+	//! Number of client requests this server has served
+	idx_t RequestCount() const {
+		return request_count;
+	}
+	//! Number of client transport connections this server has accepted. Compared against
+	//! RequestCount() this shows whether clients hold their connections open across requests.
+	idx_t ClientConnectionCount() const {
+		return client_connection_count;
+	}
+
 protected:
+	//! Account for a request arriving over the client transport connection identified by
+	//! `connection_key` (for HTTP, the client's remote port).
+	void RecordRequest(int connection_key);
+
 	//! Handle one request, turning any exception raised along the way into an ErrorResponse
 	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream);
 	unique_ptr<QuackMessage> DispatchMessage(MemoryStream &read_stream);
@@ -191,6 +205,9 @@ protected:
 	//! Min-heap of the expiry-queue slots, at most one per connection with a cache
 	mutex cache_expiry_mutex;
 	std::priority_queue<CacheExpiryEntry, vector<CacheExpiryEntry>, CacheExpiresLater> cache_expiry_queue;
+
+	atomic<idx_t> request_count {0};
+	atomic<idx_t> client_connection_count {0};
 
 	QuackUri uri;
 	string ssl_fingerprint;
