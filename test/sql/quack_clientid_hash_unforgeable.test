@@ -7,6 +7,10 @@ include test/template/quack_setup.test_template
 statement ok
 attach {server} as rc (token 'asdf', client_id 'victim_client');
 
+# the session opens on first use of the attachment, not at ATTACH
+statement ok
+from quack_query_by_name('rc', 'select 42');
+
 # SECURITY CONTRACT: knowing the shared token 'asdf' + the client_id must NOT let anyone recompute the hash
 # (else a co-tenant holding the same server token could forge victim_client's reconnect key)
 query I quack_db:quack_server_con

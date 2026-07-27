@@ -17,8 +17,12 @@ statement ok
 SET quack_default_client_id='auto_default_client';
 
 # No explicit client_id -> inherits the default -> a non-NULL client_id_hash appears.
+# The session is opened on first use of the attachment, not by ATTACH itself.
 statement ok
 attach {server} as rpc_def (token 'asdf');
+
+statement ok
+from quack_query_by_name('rpc_def', 'select 42');
 
 query I quack_db:quack_server_con
 SELECT count(*) FILTER (WHERE client_id_hash IS NOT NULL) FROM quack_active_connections();
@@ -28,6 +32,9 @@ SELECT count(*) FILTER (WHERE client_id_hash IS NOT NULL) FROM quack_active_conn
 # Default-derived and explicit client_id with the same value yield one distinct hash.
 statement ok
 attach {server} as rpc_exp (token 'asdf', client_id 'auto_default_client');
+
+statement ok
+from quack_query_by_name('rpc_exp', 'select 42');
 
 query II quack_db:quack_server_con
 SELECT count(*) FILTER (WHERE client_id_hash IS NOT NULL), count(DISTINCT client_id_hash)
@@ -45,6 +52,9 @@ detach rpc_exp;
 statement ok
 attach {server} as rpc_optout (token 'asdf', client_id '');
 
+statement ok
+from quack_query_by_name('rpc_optout', 'select 42');
+
 query I quack_db:quack_server_con
 SELECT count(*) FILTER (WHERE client_id_hash IS NOT NULL) FROM quack_active_connections();
 ----
@@ -59,6 +69,9 @@ SET quack_default_client_id='';
 
 statement ok
 attach {server} as rpc_none (token 'asdf');
+
+statement ok
+from quack_query_by_name('rpc_none', 'select 42');
 
 query I quack_db:quack_server_con
 SELECT count(*) FILTER (WHERE client_id_hash IS NOT NULL) FROM quack_active_connections();

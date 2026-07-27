@@ -26,22 +26,54 @@
 
 namespace duckdb {
 
-QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
-                           const string &token, string client_id, idx_t heartbeat_timeout_seconds)
-    : Catalog(db_p) {
-	// connect to the server
-	client_connection =
-	    QuackClient::ConnectToServer(context, server_uri, token, std::move(client_id), heartbeat_timeout_seconds);
-
-	// load the entire catalog up-front
-	auto load_info = LoadCatalog(context);
-	schemas = make_uniq<QuackSchemaSet>(context, *this, load_info);
+QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri_p, ClientContext &context,
+                           const string &token_p, string client_id_p, idx_t heartbeat_timeout_seconds_p,
+                           bool eager_catalog)
+    : Catalog(db_p), server_uri(server_uri_p), token(token_p), client_id(std::move(client_id_p)),
+      heartbeat_timeout_seconds(heartbeat_timeout_seconds_p) {
+	if (eager_catalog) {
+		// the caller wants ATTACH to prove the server is reachable and the token is good
+		EnsureLoaded(context);
+	}
 }
 
-QuackLoadCatalogData QuackCatalog::LoadCatalog(ClientContext &context) {
+void QuackCatalog::EnsureLoaded(ClientContext &context) {
+	std::unique_lock<mutex> guard(load_lock);
+	// another thread may already be loading - wait for it rather than loading twice
+	load_cv.wait(guard, [&] { return !loading; });
+	if (loaded) {
+		return;
+	}
+	loading = true;
+	guard.unlock();
+
+	// Deliberately outside the lock: the load itself queries the server, and when a server and
+	// a client attached to it share a process that query comes back through this catalog. See
+	// ScanSchemas.
+	try {
+		auto connection =
+		    QuackClient::ConnectToServer(context, server_uri, token, client_id, heartbeat_timeout_seconds);
+		auto load_info = LoadCatalogWith(context, *connection);
+		auto loaded_schemas = make_uniq<QuackSchemaSet>(context, *this, load_info);
+
+		guard.lock();
+		client_connection = std::move(connection);
+		schemas = std::move(loaded_schemas);
+		loaded = true;
+	} catch (...) {
+		guard.lock();
+		loading = false;
+		load_cv.notify_all();
+		throw;
+	}
+	loading = false;
+	load_cv.notify_all();
+}
+
+QuackLoadCatalogData QuackCatalog::LoadCatalogWith(ClientContext &context, QuackClientConnection &connection) {
 	QuackLoadCatalogData result;
-	result.schemas = ExecuteCommandInternal(context, QuackSchemaSet::GetLoadQuery());
-	result.tables = ExecuteCommandInternal(context, QuackTableSet::GetLoadQuery());
+	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery());
+	result.tables = ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery());
 	return result;
 }
 
@@ -72,6 +104,18 @@ static vector<Identifier> GetSchemaPath(const EntryLookupInfo &schema_lookup) {
 optional_ptr<SchemaCatalogEntry> QuackCatalog::LookupSchema(CatalogTransaction transaction,
                                                             const EntryLookupInfo &schema_lookup,
                                                             OnEntryNotFound if_not_found) {
+	auto context = transaction.context;
+	if (!context) {
+		// no context to connect with; an unloaded catalog simply has no entries to offer
+		if (!loaded) {
+			return nullptr;
+		}
+	} else {
+		EnsureLoaded(*context);
+	}
+	if (!schemas) {
+		return nullptr;
+	}
 	auto schema_path = GetSchemaPath(schema_lookup);
 	// navigate the schema chain: the outermost schema lives in the catalog, each nested one in its parent
 	reference<QuackCatalogSet> current_set = *schemas;
@@ -95,35 +139,76 @@ optional_ptr<SchemaCatalogEntry> QuackCatalog::LookupSchema(CatalogTransaction t
 	return entry->Cast<SchemaCatalogEntry>();
 }
 
-const QuackUri &QuackCatalog::GetServerUri() {
-	return client_connection->ServerURI();
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+	EnsureLoaded(context);
+	return ExecuteCommandOn(context, *client_connection, query);
 }
 
-unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
-	// FIXME this will break with many results!
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &context,
+                                                                QuackClientConnection &connection,
+                                                                const string &query) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	auto client_wrapper = client_connection->GetClient(context);
+	auto client_wrapper = connection.GetClient(context);
 	auto &client = client_wrapper->GetClient();
-	auto response =
-	    client.Request<PrepareResponseMessage>(context, make_uniq<PrepareRequestMessage>(GetConnectionId(), query, 0));
+	auto response = client.Request<PrepareResponseMessage>(
+	    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
 	}
+	// Drain the rest. A catalog wider than one FETCH batch used to be silently truncated,
+	// dropping tables and views: harmless while the load ran during ATTACH with default
+	// settings, but it loads on first use now, under whatever batch size is in effect then.
+	auto query_uuid = response->QueryUUID();
+	for (idx_t batch_index = 1; response->NeedsMoreFetch(); batch_index++) {
+		// Batches are claimed by dense index; every batch below this one has arrived, so ack them.
+		auto fetch_response = client.Request<FetchResponseMessage>(
+		    context, make_uniq<FetchRequestMessage>(connection.ConnectionId(), query_uuid, batch_index,
+		                                            batch_index - 1));
+		if (fetch_response->MutableResults().empty()) {
+			break;
+		}
+		for (auto &chunk : fetch_response->MutableResults()) {
+			chunk_collection->Append(*chunk);
+		}
+	}
 	return chunk_collection;
 }
 
+shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection(ClientContext &context) {
+	EnsureLoaded(context);
+	return client_connection;
+}
+
 shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection() {
+	if (!client_connection) {
+		throw InternalException("Quack catalog was used before it was loaded");
+	}
 	return client_connection;
 }
 
 void QuackCatalog::Refresh(ClientContext &context) {
-	auto load_info = LoadCatalog(context);
+	{
+		lock_guard<mutex> guard(load_lock);
+		if (!loaded) {
+			// nothing is cached yet - the next use will read a fresh catalog anyway
+			return;
+		}
+	}
+	auto load_info = LoadCatalogWith(context, *client_connection);
 	schemas->Reload(context, *this, load_info);
 }
 
+const string &QuackCatalog::GetConnectionId(ClientContext &context) {
+	EnsureLoaded(context);
+	return client_connection->ConnectionId();
+}
+
 const string &QuackCatalog::GetConnectionId() {
+	if (!client_connection) {
+		throw InternalException("Quack catalog was used before it was loaded");
+	}
 	return client_connection->ConnectionId();
 }
 
@@ -146,6 +231,9 @@ QuackCatalog &QuackCatalog::GetQuackCatalog(ClientContext &context, Value &catal
 }
 
 optional_ptr<CatalogEntry> QuackCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+	if (transaction.context) {
+		EnsureLoaded(*transaction.context);
+	}
 	// find the set the schema goes in - the catalog itself for a top-level schema, the deepest parent for a
 	// nested one. This runs before the schema is created on the server so a bad path does not leave the
 	// server and the local catalog out of sync
@@ -182,6 +270,20 @@ static void ScanNestedSchemas(QuackSchemaCatalogEntry &schema,
 }
 
 void QuackCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	{
+		lock_guard<mutex> guard(load_lock);
+		if (loading) {
+			// A load is in flight, and this scan may be that load's own catalog query coming
+			// back around - a server and a client attached to it can share a process, and
+			// enumerating schemas there reaches this catalog again. It has none to report
+			// yet, which is the truth; waiting instead would deadlock against the load.
+			return;
+		}
+	}
+	EnsureLoaded(context);
+	if (!schemas) {
+		return;
+	}
 	for (auto &schema : schemas->GetAllCatalogEntries()) {
 		ScanNestedSchemas(schema.get().Cast<QuackSchemaCatalogEntry>(), callback);
 	}
@@ -240,7 +342,8 @@ bool QuackCatalog::InMemory() {
 	return false;
 }
 string QuackCatalog::GetDBPath() {
-	return client_connection->ServerURI().Uri();
+	// read from the stored URI, not the session: duckdb_databases() must not force a load
+	return server_uri.Uri();
 }
 
 void QuackCatalog::DropSchema(ClientContext &context, DropInfo &info) {

@@ -42,8 +42,9 @@ true
 sleep 2 seconds
 
 # Any inbound traffic runs the sweep.
+# eager_catalog: this ATTACH exists to put a request on the wire, and a lazy one sends none.
 statement ok
-ATTACH {server} AS sweeper;
+ATTACH {server} AS sweeper (eager_catalog true);
 
 query I quack_db:quack_server_con
 SELECT count(cached_rows) FROM quack_active_connections();

@@ -11,8 +11,10 @@ CALL enable_logging('Quack');
 statement ok quack_db:quack_server_con
 CALL enable_logging('Quack');
 
+# eager_catalog: the lease being tested only exists once a session does, and a lazy attach
+# opens none until first use.
 statement ok
-ATTACH {server} AS heartbeat_client (token 'asdf', heartbeat_timeout 1);
+ATTACH {server} AS heartbeat_client (token 'asdf', heartbeat_timeout 1, eager_catalog true);
 
 # Remain idle for several lease periods. Only the background heartbeat can keep this session alive.
 sleep 3 seconds
