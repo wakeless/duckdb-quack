@@ -230,6 +230,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "executor blocks when the client falls this far behind",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT));
 
+	config.AddExtensionOption("quack_join_pushdown",
+	                          "Allow joins between two scans of one server to execute on that server",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	config.AddExtensionOption("quack_assumed_scan_cardinality",
 	                          "Assumed row count for remote scans without a server estimate (0 disables)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(100000));

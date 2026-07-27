@@ -1,0 +1,59 @@
+# name: test/sql/union_views_aggregate_large.test_slow
+# description: a grouped aggregate over a large remote leg returns only grouped rows
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.events_base as
+    select range id, range % 97 as val, case when range % 10 = 0 then 'x' else 'y' end as status
+    from range(100000);
+
+statement ok quack_db:quack_server_con
+create view remote_site.events as from remote_site.events_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.events as
+    select range id, range % 97 as val, case when range % 10 = 0 then 'x' else 'y' end as status
+    from range(100000);
+
+statement ok con2
+create view events as (select 'a' as site, * from local_site.events) union all (select 'b' as site, * from remote.remote_site.events);
+
+# without pushdown the remote leg would stream 100k rows (many FETCH batches);
+# grouped server-side, the handful of grouped rows fit in the PREPARE response
+statement ok con2
+call enable_logging('Quack');
+
+query III con2
+select site, count(*), sum(val) from events where status = 'x' group by site order by site;
+----
+a	10000	479928
+b	10000	479928
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'FETCH_REQUEST';
+----
+0
+
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'PREPARE_REQUEST' and query like '%GROUP BY%';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
