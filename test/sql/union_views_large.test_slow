@@ -1,0 +1,164 @@
+# name: test/sql/union_views_large.test_slow
+# description: union views whose remote leg needs multiple FETCH batches
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# Each remote leg holds 100k rows — well past one FETCH batch, so the by-name
+# scan behind the view must stream follow-up FETCH requests instead of
+# completing within the bind-time PREPARE response.
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.events_base as select range id, range % 97 as val from range(100000);
+
+statement ok quack_db:quack_server_con
+create table remote_site.metrics_base as select range id, range % 31 as m from range(100000);
+
+statement ok quack_db:quack_server_con
+create view remote_site.events as from remote_site.events_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.metrics as from remote_site.metrics_base;
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.events as select range id, range % 97 as val from range(100000);
+
+statement ok con2
+create table local_site.metrics as select range id, range % 31 as m from range(100000);
+
+statement ok con2
+create view events as (select 'a' as site, * from local_site.events) union all (select 'b' as site, * from remote.remote_site.events);
+
+statement ok con2
+create view metrics as (select 'a' as site, * from local_site.metrics) union all (select 'b' as site, * from remote.remote_site.metrics);
+
+# A single union view streams its remote leg across many FETCH batches, with
+# the client-side projection applied to every batch.
+query II con2
+select site, count(*) from events group by 1 order by 1;
+----
+a	100000
+b	100000
+
+query I con2
+select sum(val) from events;
+----
+9599370
+
+# Two union views in one query need two by-name scans on one connection: the
+# second scan's PREPARE moves the first scan's remaining batches into a
+# server-side buffer, and both stream to completion.
+query I con2
+select count(*) from events e join metrics m on e.id = m.id and e.site = m.site;
+----
+200000
+
+# ---------------------------------------------------------------------------
+# A selective filter through the union view runs on the server: the matching
+# rows fit in the PREPARE response, so the scan never issues a follow-up
+# FETCH for the remote leg.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call enable_logging('Quack');
+
+query II con2
+select site, count(*) from events where id < 100 group by site order by site;
+----
+a	100
+b	100
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'FETCH_REQUEST';
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
+# EXPLAIN of a union view binds the remote leg schema-only: nothing executes
+# on the server, so there is nothing to fetch and nothing to close. (A direct
+# remote reference goes through the statement-level rewrite instead, which
+# binds eagerly on purpose - its result doubles as the first batch.)
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging('Quack');
+
+statement ok con2
+explain select * from events;
+
+query I con2
+select count(*) from duckdb_logs_parsed('Quack') where message_type in ('FETCH_REQUEST', 'CLOSE_RESULT_REQUEST');
+----
+0
+
+statement ok con2
+call disable_logging();
+
+# ---------------------------------------------------------------------------
+# The eager path still cleans up after itself: EXPLAIN of a direct remote
+# reference goes through the statement-level rewrite, whose bind executes
+# eagerly; the abandoned result is closed instead of left buffered.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+call truncate_duckdb_logs();
+
+statement ok con2
+call enable_logging('Quack');
+
+statement ok con2
+explain select * from remote.remote_site.events;
+
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CLOSE_RESULT_REQUEST';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# scans that end early (e.g. a LIMIT over the union view) still return correct
+# results
+query I con2
+select count(*) from (select id from events limit 5) t;
+----
+5
+
+# ---------------------------------------------------------------------------
+# Re-executing a prepared statement re-runs the remote query: the bind-time
+# result was consumed by the first execution, so replaying its cached first
+# batch would silently drop the remaining batches.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+prepare events_total as select min(id), max(val), count(*) from (select site, id, val from events) t;
+
+query III con2
+execute events_total;
+----
+0	96	200000
+
+query III con2
+execute events_total;
+----
+0	96	200000
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template

@@ -190,6 +190,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Rows a thread buffers before flushing one SEND_DATA_REQUEST (0 = default 204800)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
+	config.AddExtensionOption("quack_join_pushdown",
+	                          "Allow joins between two scans of one server to execute on that server",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	config.AddExtensionOption("quack_assumed_scan_cardinality",
 	                          "Assumed row count for remote scans without a server estimate (0 disables)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(100000));

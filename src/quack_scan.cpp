@@ -4,6 +4,8 @@
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/optimizer/column_lifetime_analyzer.hpp"
 
 #include "quack_scan.hpp"
 #include "quack_filter_sql.hpp"
@@ -526,6 +528,14 @@ InsertionOrderPreservingMap<string> QuackScanToString(TableFunctionToStringInput
 	auto &bind_data = input.bind_data->Cast<QuackScanBindData>();
 	InsertionOrderPreservingMap<string> result;
 	result["Server"] = bind_data.client_connection->ServerURI().Uri();
+	if (!bind_data.remote_filters.empty()) {
+		result["Remote Filters"] = StringUtil::Join(bind_data.remote_filters, " AND ");
+	}
+	if (bind_data.remote_query_rewritten) {
+		// Only worth showing once an absorbed aggregate or join has rewritten it; the raw
+		// bind-time query of an untouched scan says nothing the plan does not already.
+		result["Remote Query"] = bind_data.remote_query;
+	}
 	return result;
 }
 
@@ -544,6 +554,306 @@ BindInfo QuackScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 		return BindInfo(*bind_data.table_entry);
 	}
 	return BindInfo(ScanType::EXTERNAL);
+}
+
+static string JoinComparisonOperator(ExpressionType comparison) {
+	switch (comparison) {
+	case ExpressionType::COMPARE_EQUAL:
+		return "=";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return "<>";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return "<";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return "<=";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ">";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ">=";
+	case ExpressionType::COMPARE_DISTINCT_FROM:
+		return "IS DISTINCT FROM";
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+		return "IS NOT DISTINCT FROM";
+	default:
+		return string();
+	}
+}
+
+//! Render one side of an absorbed join as a subquery the server can re-parse.
+static bool RenderJoinSide(const LogicalGet &get, const QuackScanBindData &bind_data, const string &alias,
+                           string &subquery) {
+	if (!get.projection_ids.empty()) {
+		// this pass runs before column pruning; a pruned scan is unexpected, fail closed
+		return false;
+	}
+	for (auto &col_index : get.GetColumnIds()) {
+		if (col_index.IsVirtualColumn() || col_index.GetPrimaryIndex() >= bind_data.column_names.size()) {
+			return false;
+		}
+	}
+	vector<string> where_clauses = bind_data.remote_filters;
+	if (get.table_filters.HasFilters()) {
+		string filter_clause;
+		try {
+			filter_clause = BuildFilterWhereClause(get.table_filters, get.GetColumnIds(), bind_data.column_names,
+			                                       bind_data.column_types);
+		} catch (const InternalException &) {
+			// a required filter this side cannot serialize: leave the join in the plan
+			return false;
+		}
+		if (!filter_clause.empty()) {
+			where_clauses.push_back(std::move(filter_clause));
+		}
+	}
+	subquery = StringUtil::Format("(FROM (%s)", bind_data.remote_query);
+	if (!where_clauses.empty()) {
+		subquery += " WHERE " + StringUtil::Join(where_clauses, " AND ");
+	}
+	subquery += ") AS " + alias;
+	return true;
+}
+
+static bool QuackScanPushdownAggregate(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                       const vector<unique_ptr<Expression>> &groups,
+                                       const vector<unique_ptr<Expression>> &aggregates, vector<LogicalType> &new_types,
+                                       vector<Identifier> &new_names) {
+	if (!bind_data_p || groups.empty() || aggregates.empty()) {
+		return false;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	if (!bind_data.table_name.empty() || bind_data.remote_query.empty()) {
+		return false;
+	}
+	for (auto &aggregate : aggregates) {
+		// An aggregate asked to export its partial state cannot be reproduced as remote SQL:
+		// the server would return the final value where the plan expects a serialized state.
+		if (aggregate->GetReturnType().IsAggregateState()) {
+			return false;
+		}
+	}
+	auto &column_ids = get.GetColumnIds();
+
+	// render everything before touching any state, so a failed render leaves the scan as-is
+	vector<string> select_list;
+	vector<string> group_by;
+	vector<LogicalType> types;
+	vector<string> names;
+	case_insensitive_set_t used_names;
+	auto unique_name = [&](string base) {
+		auto candidate = base;
+		for (idx_t i = 2; used_names.find(candidate) != used_names.end(); i++) {
+			candidate = base + "_" + to_string(i);
+		}
+		used_names.insert(candidate);
+		return candidate;
+	};
+	for (idx_t i = 0; i < groups.size(); i++) {
+		auto &group = *groups[i];
+		auto rendered = RenderComplexFilter(group, column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			return false;
+		}
+		string base = "group_" + to_string(i + 1);
+		if (group.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto col = group.Cast<BoundColumnRefExpression>().Binding().column_index.GetIndex();
+			base = bind_data.column_names[column_ids[col].GetPrimaryIndex()];
+		}
+		// constant group keys (leg tags) group as well: unlike a global aggregate, grouping by
+		// a constant yields no row for an empty input, matching the aggregate being replaced
+		group_by.push_back(to_string(select_list.size() + 1));
+		auto name = unique_name(base);
+		select_list.push_back(rendered + " AS " + SQLIdentifier::ToString(name));
+		types.push_back(group.GetReturnType());
+		names.push_back(std::move(name));
+	}
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto rendered = RenderAggregateCall(*aggregates[i], column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			return false;
+		}
+		auto name = unique_name("aggregate_" + to_string(i + 1));
+		select_list.push_back(rendered + " AS " + SQLIdentifier::ToString(name));
+		types.push_back(aggregates[i]->GetReturnType());
+		names.push_back(std::move(name));
+	}
+	// filters already pushed into this scan apply before the aggregation
+	vector<string> where_clauses = bind_data.remote_filters;
+	if (get.table_filters.HasFilters()) {
+		auto filter_clause =
+		    BuildFilterWhereClause(get.table_filters, column_ids, bind_data.column_names, bind_data.column_types);
+		if (!filter_clause.empty()) {
+			where_clauses.push_back(std::move(filter_clause));
+		}
+	}
+
+	auto query =
+	    "SELECT " + StringUtil::Join(select_list, ", ") + StringUtil::Format(" FROM (%s)", bind_data.remote_query);
+	if (!where_clauses.empty()) {
+		query += " WHERE " + StringUtil::Join(where_clauses, " AND ");
+	}
+	query += " GROUP BY " + StringUtil::Join(group_by, ", ");
+
+	// commit: the scan now produces the grouped result; the bind-time raw-relation result is
+	// not replayable (its pending server result is still closed by the bind data destructor)
+	bind_data.remote_query = std::move(query);
+	bind_data.remote_query_rewritten = true;
+	bind_data.column_names = names;
+	bind_data.column_types = types;
+	bind_data.remote_filters.clear();
+	bind_data.results.clear();
+	bind_data.has_unconsumed_bind_result = false;
+	bind_data.needs_more_fetch = true;
+	new_types = std::move(types);
+	for (auto &name : names) {
+		new_names.emplace_back(std::move(name));
+	}
+	return true;
+}
+
+static bool QuackScanPushdownJoin(ClientContext &context, LogicalGet &left_get, LogicalGet &right_get,
+                                  FunctionData *left_bind_data, FunctionData *right_bind_data, JoinType join_type,
+                                  const vector<JoinCondition> &conditions, vector<LogicalType> &new_types,
+                                  vector<Identifier> &new_names) {
+	if (!left_bind_data || !right_bind_data) {
+		return false;
+	}
+	auto &left = left_bind_data->Cast<QuackScanBindData>();
+	auto &right = right_bind_data->Cast<QuackScanBindData>();
+	Value setting;
+	if (context.TryGetCurrentSetting("quack_join_pushdown", setting) && !BooleanValue::Get(setting)) {
+		DUCKDB_LOG_INFO(context, "quack join pushdown: disabled by quack_join_pushdown");
+		return false;
+	}
+	if (left.client_connection->ConnectionId() != right.client_connection->ConnectionId() ||
+	    !(left.client_connection->ServerURI() == right.client_connection->ServerURI())) {
+		DUCKDB_LOG_INFO(context, "quack join pushdown: the scans use different connections");
+		return false;
+	}
+	if (!left.table_name.empty() || left.remote_query.empty() || !right.table_name.empty() ||
+	    right.remote_query.empty()) {
+		DUCKDB_LOG_INFO(context, "quack join pushdown: only by-name scans can absorb joins");
+		return false;
+	}
+	string join_keyword;
+	switch (join_type) {
+	case JoinType::INNER:
+		join_keyword = "INNER JOIN";
+		break;
+	case JoinType::LEFT:
+		join_keyword = "LEFT JOIN";
+		break;
+	default:
+		return false;
+	}
+
+	// render everything before touching any state, so a failed render leaves the join as-is
+	string left_subquery;
+	string right_subquery;
+	if (!RenderJoinSide(left_get, left, "t0", left_subquery) ||
+	    !RenderJoinSide(right_get, right, "t1", right_subquery)) {
+		DUCKDB_LOG_INFO(context, "quack join pushdown: a join side could not be rendered");
+		return false;
+	}
+	vector<string> on_clauses;
+	for (auto &condition : conditions) {
+		auto comparison = JoinComparisonOperator(condition.GetComparisonType());
+		if (comparison.empty()) {
+			DUCKDB_LOG_INFO(context, "quack join pushdown: unsupported comparison in a join condition");
+			return false;
+		}
+		auto lhs = RenderComplexFilter(condition.GetLHS(), left_get.GetColumnIds(), left.column_names,
+		                               left.column_types, "t0");
+		auto rhs = RenderComplexFilter(condition.GetRHS(), right_get.GetColumnIds(), right.column_names,
+		                               right.column_types, "t1");
+		if (lhs.empty() || rhs.empty()) {
+			DUCKDB_LOG_INFO(context, "quack join pushdown: join condition not deparseable: %s",
+			                condition.GetLHS().ToString() + " vs " + condition.GetRHS().ToString());
+			return false;
+		}
+		on_clauses.push_back(lhs + " " + comparison + " " + rhs);
+	}
+
+	// the merged select list: the left scan's projected columns, then the right's, with names
+	// kept unique so later passes (column pruning, aggregate pushdown) can address them
+	vector<string> select_list;
+	vector<string> names;
+	vector<LogicalType> types;
+	case_insensitive_set_t used_names;
+	auto unique_name = [&](const string &base) {
+		auto candidate = base;
+		for (idx_t i = 2; used_names.find(candidate) != used_names.end(); i++) {
+			candidate = base + "_" + to_string(i);
+		}
+		used_names.insert(candidate);
+		return candidate;
+	};
+	auto add_side = [&](const LogicalGet &get, const QuackScanBindData &bind_data, const string &alias) {
+		for (auto &col_index : get.GetColumnIds()) {
+			auto col_id = col_index.GetPrimaryIndex();
+			auto name = unique_name(bind_data.column_names[col_id]);
+			select_list.push_back(alias + "." + SQLIdentifier::ToString(bind_data.column_names[col_id]) + " AS " +
+			                      SQLIdentifier::ToString(name));
+			names.push_back(std::move(name));
+			types.push_back(bind_data.column_types[col_id]);
+		}
+	};
+	add_side(left_get, left, "t0");
+	add_side(right_get, right, "t1");
+
+	auto query = "SELECT " + StringUtil::Join(select_list, ", ") + " FROM " + left_subquery + " " + join_keyword + " " +
+	             right_subquery + " ON " + StringUtil::Join(on_clauses, " AND ");
+
+	// commit: the left scan now produces the joined result
+	left.remote_query = std::move(query);
+	left.remote_query_rewritten = true;
+	left.column_names = names;
+	left.column_types = types;
+	left.remote_filters.clear();
+	left.results.clear();
+	left.has_unconsumed_bind_result = false;
+	left.needs_more_fetch = true;
+	new_types = std::move(types);
+	for (auto &name : names) {
+		new_names.emplace_back(std::move(name));
+	}
+	return true;
+}
+
+static bool QuackScanPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	// anything accepted here becomes a required filter the scan must enforce, so acceptance
+	// has to equal serializability
+	return IsDeparseSafe(expr);
+}
+
+static void QuackScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data_p,
+                                           vector<unique_ptr<Expression>> &filters) {
+	if (!bind_data_p) {
+		return;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	auto &column_ids = get.GetColumnIds();
+	for (idx_t i = 0; i < filters.size();) {
+		auto &expr = *filters[i];
+		// single-column non-throwing expressions go through the regular table-filter path,
+		// which keeps them visible for statistics and EXPLAIN; consume only what that path
+		// will not take (e.g. fallible functions like json extraction, or predicates over
+		// several columns)
+		vector<ColumnBinding> bindings;
+		ColumnLifetimeAnalyzer::ExtractColumnBindings(expr, bindings);
+		bool single_column = !bindings.empty() && std::all_of(bindings.begin(), bindings.end(),
+		                                                      [&](const ColumnBinding &b) { return b == bindings[0]; });
+		if (expr.IsVolatile() || bindings.empty() || (single_column && !expr.CanThrow())) {
+			i++;
+			continue;
+		}
+		auto rendered = RenderComplexFilter(expr, column_ids, bind_data.column_names, bind_data.column_types);
+		if (rendered.empty()) {
+			i++;
+			continue;
+		}
+		bind_data.remote_filters.push_back(std::move(rendered));
+		filters.erase(filters.begin() + NumericCast<int64_t>(i));
+	}
 }
 
 static unique_ptr<NodeStatistics> QuackScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
@@ -581,6 +891,10 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.cardinality = QuackScanCardinality;
+	fun.pushdown_expression = QuackScanPushdownExpression;
+	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
+	fun.pushdown_aggregate = QuackScanPushdownAggregate;
+	fun.pushdown_join = QuackScanPushdownJoin;
 	fun.filter_pushdown = true;
 	fun.filter_prune = true;
 	return fun;
@@ -596,6 +910,10 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.cardinality = QuackScanCardinality;
+	fun.pushdown_expression = QuackScanPushdownExpression;
+	fun.pushdown_complex_filter = QuackScanPushdownComplexFilter;
+	fun.pushdown_aggregate = QuackScanPushdownAggregate;
+	fun.pushdown_join = QuackScanPushdownJoin;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
 	fun.named_parameters["eager"] = LogicalType::BOOLEAN;
 	fun.filter_pushdown = true;

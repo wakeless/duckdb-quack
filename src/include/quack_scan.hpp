@@ -20,6 +20,7 @@ struct QuackScanBindData : FunctionData {
 		result->table_name = table_name;
 		result->remote_query = remote_query;
 		result->remote_filters = remote_filters;
+		result->remote_query_rewritten = remote_query_rewritten;
 		result->estimated_cardinality = estimated_cardinality;
 		result->column_names = column_names;
 		result->column_types = column_types;
@@ -41,6 +42,9 @@ struct QuackScanBindData : FunctionData {
 	//! replays those chunks; once consumed (a re-executed prepared statement) the original query
 	//! must be re-issued instead of replaying a result that is no longer there.
 	bool has_unconsumed_bind_result = false;
+	//! Whether remote_query was rewritten by an absorbed aggregate or join. Shown in EXPLAIN;
+	//! the raw bind-time query of an untouched scan is not.
+	bool remote_query_rewritten = false;
 	//! Row estimate the server reported for this query; 0 when it reported none
 	idx_t estimated_cardinality = 0;
 	hugeint_t query_uuid;
@@ -48,11 +52,11 @@ struct QuackScanBindData : FunctionData {
 
 	~QuackScanBindData() override {
 		if (!completed && query_uuid != hugeint_t {0, 0}) {
-			try {
-				client_connection->CancelQuery(query_uuid);
-			} catch (...) {
-				// server may already be gone
-			}
+			// Drop just this result rather than cancelling: a connection can hold several
+			// pending results and Interrupt() cannot spare the others, so cancelling here
+			// would take down a concurrent scan on the same connection. Nothing is executing
+			// server-side between requests, so there is no work to interrupt.
+			client_connection->CloseResult(query_uuid);
 		}
 	}
 };
