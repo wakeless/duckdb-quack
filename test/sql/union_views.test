@@ -1,0 +1,255 @@
+# name: test/sql/union_views.test
+# description: union views with one local leg and one remote (server-side view) leg
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+require json
+
+# ---------------------------------------------------------------------------
+# Server side: base tables in a named schema, each exposed as a VIEW.
+# Server-side views bind opaquely on the client (quack_query_by_name), so the
+# whole view subquery is evaluated on the server.
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+create schema remote_site;
+
+statement ok quack_db:quack_server_con
+create table remote_site.projects_base(id int, org varchar, name varchar, settings varchar, deadline date);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.projects_base values
+    (1, 'org_a', 'beta', '{"feature_enabled": "true", "start_date": "2024-02-01"}', date '2024-06-01'),
+    (2, 'org_b', 'gamma', '{"feature_enabled": "false"}', date '2024-07-01'),
+    (3, 'internal', 'infra', '{"feature_enabled": "true"}', date '2024-08-01'),
+    (4, NULL, 'orphan', '{"feature_enabled": "true"}', date '2024-05-01');
+
+statement ok quack_db:quack_server_con
+create table remote_site.memberships_base(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.memberships_base values
+    (1, 'org_a', 101, 'member', 'false'),
+    (1, 'org_a', 102, 'member', NULL),
+    (1, 'org_a', 103, 'member', 'true'),
+    (1, 'org_a', 104, 'admin', 'false'),
+    (2, 'org_b', 201, 'member', 'false');
+
+statement ok quack_db:quack_server_con
+create table remote_site.teams_base(id int, project_id int, org varchar);
+
+statement ok quack_db:quack_server_con
+insert into remote_site.teams_base values
+    (1, 1, 'org_a'),
+    (2, 1, 'org_a'),
+    (3, 2, 'org_b');
+
+statement ok quack_db:quack_server_con
+create view remote_site.projects as from remote_site.projects_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.memberships as from remote_site.memberships_base;
+
+statement ok quack_db:quack_server_con
+create view remote_site.teams as from remote_site.teams_base;
+
+# ---------------------------------------------------------------------------
+# Client side: same-shaped local tables, then union views that tag each leg
+# with a `site` column ('a' = local, 'b' = remote).
+# ---------------------------------------------------------------------------
+
+statement ok con2
+attach {server} as remote (token 'asdf')
+
+statement ok con2
+create schema local_site;
+
+statement ok con2
+create table local_site.projects(id int, org varchar, name varchar, settings varchar, deadline date);
+
+statement ok con2
+insert into local_site.projects values
+    (1, 'org_a', 'alpha', '{"feature_enabled": "true", "start_date": "2024-01-01"}', date '2024-03-01'),
+    (2, 'org_c', 'delta', '{"feature_enabled": "false"}', date '2024-04-01'),
+    (3, 'internal', 'tools', '{"feature_enabled": "true"}', date '2024-02-01');
+
+statement ok con2
+create table local_site.memberships(project_id int, org varchar, user_id int, role varchar, removed varchar);
+
+statement ok con2
+insert into local_site.memberships values
+    (1, 'org_a', 11, 'member', 'false'),
+    (1, 'org_a', 12, 'member', 'false'),
+    (2, 'org_c', 21, 'member', NULL),
+    (2, 'org_c', 22, 'member', 'true'),
+    (1, 'org_a', 13, 'admin', NULL);
+
+statement ok con2
+create view projects as (select 'a' as site, * from local_site.projects) union all (select 'b' as site, * from remote.remote_site.projects);
+
+statement ok con2
+create view memberships as (select 'a' as site, * from local_site.memberships) union all (select 'b' as site, * from remote.remote_site.memberships);
+
+# ---------------------------------------------------------------------------
+# Single remote leg, union view over both legs, scan binding.
+# ---------------------------------------------------------------------------
+
+query I con2
+select count(*) from remote.remote_site.projects;
+----
+4
+
+query II con2
+select site, count(*) from projects group by 1 order by 1;
+----
+a	3
+b	4
+
+# The remote leg binds as an opaque by-name scan.
+query II con2
+explain select count(*) from remote.remote_site.projects where org = 'org_a';
+----
+physical_plan	<REGEX>:.*Quack Query By Name.*
+
+# ---------------------------------------------------------------------------
+# Filters and JSON extraction through the union view.
+# ---------------------------------------------------------------------------
+
+query III con2
+select site, id, name from projects where org = 'org_a' order by site, id;
+----
+a	1	alpha
+b	1	beta
+
+query II con2
+select site, id from projects where json_extract_string(settings::JSON, '$."feature_enabled"') = 'true' order by site, id;
+----
+a	1
+a	3
+b	1
+b	3
+b	4
+
+query III con2
+select site, id, json_extract_string(settings::JSON, '$."start_date"') as start_date from projects where id = 1 order by site;
+----
+a	1	2024-01-01
+b	1	2024-02-01
+
+# ---------------------------------------------------------------------------
+# Two union views in one query: each remote leg is a separate by-name scan on
+# the same connection. The statement-level remote pushdown cannot collapse
+# these queries because each view also has a local leg.
+# ---------------------------------------------------------------------------
+
+query III con2
+select p.site, p.id, mc.member_count
+from projects p
+left join (
+    select project_id, org, site, count(*) as member_count
+    from memberships
+    where role = 'member' and (removed = 'false' or removed is null)
+    group by 1, 2, 3
+) mc on mc.project_id = p.id and mc.org is not distinct from p.org and mc.site = p.site
+order by p.site, p.id;
+----
+a	1	2
+a	2	1
+a	3	NULL
+b	1	2
+b	2	1
+b	3	NULL
+b	4	NULL
+
+# The site column in the join keys is load-bearing: both legs share ids, so
+# dropping the site condition would cross-match legs.
+query I con2
+select count(*)
+from projects p
+join memberships m on m.project_id = p.id and m.site = p.site and m.org is not distinct from p.org;
+----
+10
+
+# ---------------------------------------------------------------------------
+# A reporting query over three union views: derived aggregates, JSON filter,
+# org exclusion, ORDER BY and LIMIT.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+create table local_site.teams(id int, project_id int, org varchar);
+
+statement ok con2
+insert into local_site.teams values
+    (1, 1, 'org_a'),
+    (2, 2, 'org_c');
+
+statement ok con2
+create view teams as (select 'a' as site, * from local_site.teams) union all (select 'b' as site, * from remote.remote_site.teams);
+
+query IIIII con2
+select p.site, p.id, p.name, mc.member_count, tc.team_count
+from projects p
+left join (
+    select project_id, org, site, count(*) as member_count
+    from memberships
+    where role = 'member' and (removed = 'false' or removed is null)
+    group by 1, 2, 3
+) mc on mc.project_id = p.id and mc.org is not distinct from p.org and mc.site = p.site
+left join (
+    select project_id, org, site, count(*) as team_count
+    from teams
+    group by 1, 2, 3
+) tc on tc.project_id = p.id and tc.org is not distinct from p.org and tc.site = p.site
+where json_extract_string(p.settings::JSON, '$."feature_enabled"') = 'true'
+  and (p.org <> 'internal' or p.org is null)
+order by p.org, p.deadline desc
+limit 10;
+----
+b	1	beta	2	2
+a	1	alpha	2	1
+b	4	orphan	NULL	NULL
+
+# ---------------------------------------------------------------------------
+# A union view whose legs are both LOCAL joins fine with a single
+# remote-legged view (only one remote scan in the query).
+# ---------------------------------------------------------------------------
+
+statement ok con2
+create schema local_other;
+
+statement ok con2
+create table local_site.users(id int, name varchar);
+
+statement ok con2
+insert into local_site.users values (11, 'amy'), (12, 'bob'), (13, 'cal'), (21, 'dee'), (22, 'eve');
+
+statement ok con2
+create table local_other.users(id int, name varchar);
+
+statement ok con2
+insert into local_other.users values (101, 'pat'), (102, 'quy'), (104, 'rex'), (201, 'sam');
+
+statement ok con2
+create view users as (select 'a' as site, * from local_site.users) union all (select 'b' as site, * from local_other.users);
+
+query I con2
+select count(*) from users;
+----
+9
+
+query III con2
+select m.project_id, m.site, string_agg(distinct u.name, ', ' order by u.name) as admin_names
+from memberships m
+join users u on u.id = m.user_id and u.site = m.site
+where m.role = 'admin' and (m.removed = 'false' or m.removed is null)
+group by m.project_id, m.site
+order by m.site;
+----
+1	a	cal
+1	b	rex
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
