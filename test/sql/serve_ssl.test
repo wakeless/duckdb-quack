@@ -93,7 +93,7 @@ statement ok
 detach pinned;
 
 statement error
-attach getvariable('srv').uri as pinned (type quack, token 'ssltoken', ssl_fingerprint '1111111111111111111111111111111111111111111111111111111111111111');
+attach getvariable('srv').uri as pinned (type quack, token 'ssltoken', ssl_fingerprint '1111111111111111111111111111111111111111111111111111111111111111', eager_catalog true);
 ----
 does not match the pinned ssl_fingerprint
 

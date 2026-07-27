@@ -1,0 +1,45 @@
+# name: test/sql/attach_self.test
+# description: a server attached to itself loads its catalog without recursing
+# group: [sql]
+
+require quack
+
+require httpfs
+
+# Server and client in one database. Enumerating schemas here reaches the attached
+# quack catalog, so a catalog load that both holds a lock and issues a schema query
+# would deadlock against the request it is waiting on.
+statement ok
+set variable actual_listen_uri = (select listen_uri from quack_serve('quack:localhost:0', token='asdf'));
+
+statement ok
+create table t as select range i from range(10);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach (getvariable('actual_listen_uri')) as loopback (type quack);
+
+# the load happens here, and its own schema query comes back through this catalog
+query I
+select count(*) from loopback.main.t;
+----
+10
+
+# enumerating schemas now that the catalog is loaded is fine too
+query I
+select count(*) > 0 from information_schema.schemata where catalog_name = 'loopback';
+----
+true
+
+query I
+select count(*) from loopback.main.t;
+----
+10
+
+statement ok
+detach loopback;
+
+statement ok
+call quack_stop(getvariable('actual_listen_uri'));

@@ -42,8 +42,9 @@ SET GLOBAL quack_result_ttl = 1;
 sleep 2 seconds
 
 # quack_active_connections() reports without sweeping; a connect round-trip runs the sweep.
+# eager_catalog: this ATTACH exists to put a request on the wire, and a lazy one sends none.
 statement ok
-ATTACH {server} AS sweeper;
+ATTACH {server} AS sweeper (eager_catalog true);
 
 statement ok
 DETACH sweeper;
