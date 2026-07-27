@@ -1,0 +1,87 @@
+# name: test/sql/scan_bind.test
+# description: schema-only binds, and re-executing a plan whose bind result was consumed
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t1 as select range i, ('x' || range) s from range(500);
+
+statement ok quack_db:quack_server_con
+create view v1 as from t1;
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+# ---------------------------------------------------------------------------
+# eager := false resolves the schema without executing the query. The rows still
+# come back, because the scan issues the query itself when it initialises.
+# ---------------------------------------------------------------------------
+
+query II
+select count(*), sum(i) from quack_query_by_name('remote', 'from v1', eager := false);
+----
+500	124750
+
+# identical to the eager form
+query II
+select count(*), sum(i) from quack_query_by_name('remote', 'from v1', eager := true);
+----
+500	124750
+
+# the schema is resolved either way, so a projection over the leg binds
+query I
+select count(*) from (select s from quack_query_by_name('remote', 'from v1', eager := false)) where s like 'x1%';
+----
+111
+
+# eager := false is rejected when null rather than silently treated as a default
+statement error
+select * from quack_query_by_name('remote', 'from v1', eager := NULL);
+----
+<REGEX>:.*eager cannot be null.*
+
+# ---------------------------------------------------------------------------
+# Re-executing a plan must not replay a bind-time result that has already been
+# handed out: the second execution re-issues the query instead.
+# ---------------------------------------------------------------------------
+
+statement ok
+prepare p1 as select count(*), sum(i) from quack_query_by_name('remote', 'from v1');
+
+query II
+execute p1;
+----
+500	124750
+
+query II
+execute p1;
+----
+500	124750
+
+query II
+execute p1;
+----
+500	124750
+
+# same for the catalog path
+statement ok
+prepare p2 as select count(*), sum(i) from remote.main.v1;
+
+query II
+execute p2;
+----
+500	124750
+
+query II
+execute p2;
+----
+500	124750
+
+statement ok
+detach remote;
+
+include test/template/quack_teardown.test_template

@@ -48,6 +48,12 @@
         "id": 2,
         "name": "query_uuid",
         "type": "hugeint_t"
+      },
+      {
+        "id": 3,
+        "name": "prepare_only",
+        "type": "bool",
+        "default": "false"
       }
     ]
   },

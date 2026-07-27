@@ -14,6 +14,41 @@
 #include <queue>
 namespace duckdb {
 
+//! Whether the scan should execute its query eagerly at bind time (the PREPARE response then
+//! doubles as the first result batch) or only resolve the schema. View legs bind schema-only:
+//! pushdown routinely rewrites their query, which would discard an eagerly executed result.
+static bool IsEagerBind(TableFunctionBindInput &input) {
+	auto entry = input.named_parameters.find("eager");
+	if (entry == input.named_parameters.end()) {
+		return true;
+	}
+	if (entry->second.IsNull()) {
+		throw InvalidInputException("eager cannot be null");
+	}
+	return BooleanValue::Get(entry->second);
+}
+
+static void CaptureBindResponse(QuackScanBindData &bind_data, PrepareResponseMessage &response, const string &query,
+                                bool eager, vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = response.Types();
+	names = response.Names();
+	bind_data.remote_query = query;
+	bind_data.column_names = names;
+	bind_data.column_types = return_types;
+	if (eager) {
+		bind_data.results = std::move(response.MutableResults());
+		bind_data.needs_more_fetch = response.NeedsMoreFetch();
+		bind_data.query_uuid = response.QueryUUID();
+		bind_data.has_unconsumed_bind_result = true;
+	} else {
+		// Schema-only bind: nothing executed, so there is no result to stream or close. The
+		// scan's init issues the (possibly rewritten) query as the only PREPARE.
+		bind_data.needs_more_fetch = true;
+		bind_data.query_uuid = hugeint_t(0);
+		bind_data.has_unconsumed_bind_result = false;
+	}
+}
+
 static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	// Set logging to be pretty verbose (everything except message payloads)
@@ -51,16 +86,12 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	auto client_wrapper = client_connection.GetClient(context);
 	auto &client = client_wrapper->GetClient();
 
+	auto eager = IsEagerBind(input);
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
 	auto bind_response = client.Request<PrepareResponseMessage>(
-	    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, bind_data->query_uuid));
-
-	return_types = bind_response->Types();
-	names = bind_response->Names();
-
-	bind_data->results = std::move(bind_response->MutableResults());
-	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
-	bind_data->query_uuid = bind_response->QueryUUID();
+	    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, bind_data->query_uuid,
+	                                              /*prepare_only=*/!eager));
+	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 
 	return bind_data;
 }
@@ -92,18 +123,12 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	bind_data->client_connection = catalog.GetClientConnection(context);
 	auto client_wrapper = bind_data->client_connection->GetClient(context);
 	auto &client = client_wrapper->GetClient();
+	auto eager = IsEagerBind(input);
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
 	auto bind_response = client.Request<PrepareResponseMessage>(
-	    context,
-	    make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query, bind_data->query_uuid));
-
-	return_types = bind_response->Types();
-	names = bind_response->Names();
-
-	// new stuff
-	bind_data->results = std::move(bind_response->MutableResults());
-	bind_data->needs_more_fetch = bind_response->NeedsMoreFetch();
-	bind_data->query_uuid = bind_response->QueryUUID();
+	    context, make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query,
+	                                              bind_data->query_uuid, /*prepare_only=*/!eager));
+	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 	return bind_data;
 }
 
@@ -283,12 +308,41 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 			auto &chunk = chunk_ref->Chunk();
 			results.emplace_back(chunk, ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED);
 		}
-	} else {
+	} else if (bind_data.has_unconsumed_bind_result) {
+		// The bind executed the query and its chunks are still unread: stream them.
 		for (auto &chunk_ref : bind_data.results) {
 			auto &chunk = chunk_ref->Chunk();
 			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
 		}
 		query_uuid = bind_data.query_uuid;
+		// A re-execution of this plan must not replay chunks that have been handed out already.
+		input.bind_data->CastNoConst<QuackScanBindData>().has_unconsumed_bind_result = false;
+	} else {
+		// Either the bind was schema-only, or its result was already consumed by an earlier
+		// execution of this plan: run the query now.
+		auto &client_connection = *bind_data.client_connection;
+		auto client_wrapper = client_connection.GetClient(context);
+		auto &client = client_wrapper->GetClient();
+		query_uuid = UUID::GenerateRandomUUID();
+		auto response_message = client.Request<PrepareResponseMessage>(
+		    context,
+		    make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), bind_data.remote_query, query_uuid));
+		// Chunks are consumed positionally, so a server-side schema change must fail loudly
+		// instead of mapping the wrong columns onto the scan's types.
+		if (response_message->Types() != bind_data.column_types) {
+			auto type_list = [](const vector<LogicalType> &types) {
+				return StringUtil::Join(types, types.size(), ", ",
+				                        [](const LogicalType &type) { return type.ToString(); });
+			};
+			throw InvalidInputException("quack scan: the server returned a result shaped (%s) for \"%s\", expected (%s)",
+			                            type_list(response_message->Types()), bind_data.remote_query,
+			                            type_list(bind_data.column_types));
+		}
+		needs_more_fetch = response_message->NeedsMoreFetch();
+		for (auto &chunk_ref : response_message->MutableResults()) {
+			auto &chunk = chunk_ref->Chunk();
+			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
+		}
 	}
 	// we only multithread if there is more to fetch
 	auto global_state = make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
@@ -451,6 +505,7 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.named_parameters["disable_ssl"] = LogicalType::BOOLEAN;
 	fun.named_parameters["token"] = LogicalType::VARCHAR;
 	fun.named_parameters["client_id"] = LogicalType::VARCHAR;
+	fun.named_parameters["eager"] = LogicalType::BOOLEAN;
 
 	fun.projection_pushdown = true;
 	fun.get_partition_data = QuackScanGetPartitionData;
@@ -473,6 +528,7 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
+	fun.named_parameters["eager"] = LogicalType::BOOLEAN;
 	// fun.filter_pushdown = true;
 	// fun.filter_prune = true;
 	return fun;

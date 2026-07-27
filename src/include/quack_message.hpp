@@ -138,8 +138,10 @@ class PrepareRequestMessage : public QuackMessage {
 public:
 	static constexpr MessageType TYPE = MessageType::PREPARE_REQUEST;
 
-	PrepareRequestMessage(string connection_id_p, string sql_query_p, hugeint_t query_uuid_p)
-	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)), query_uuid(query_uuid_p) {
+	PrepareRequestMessage(string connection_id_p, string sql_query_p, hugeint_t query_uuid_p,
+	                      bool prepare_only_p = false)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), sql_query(std::move(sql_query_p)), query_uuid(query_uuid_p),
+	      prepare_only(prepare_only_p) {
 	}
 
 public:
@@ -152,6 +154,10 @@ public:
 	hugeint_t QueryUUID() const {
 		return query_uuid;
 	}
+	//! Bind the query to resolve its schema without executing it
+	bool PrepareOnly() const {
+		return prepare_only;
+	}
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareRequestMessage> Deserialize(Deserializer &deserializer);
 
@@ -162,6 +168,7 @@ protected:
 private:
 	string sql_query;
 	hugeint_t query_uuid;
+	bool prepare_only = false;
 };
 
 class PrepareResponseMessage : public QuackMessage {
