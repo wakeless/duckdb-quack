@@ -48,6 +48,12 @@ public:
 	//! Stop topping up and drain all in-flight fetches; errors were already surfaced through the buffer.
 	void StopAndDrain();
 
+	//! Whether the server reported the result exhausted (a terminal FETCH). False means rows remain
+	//! server-side, so an abandoned scan should tell the server to drop the result.
+	bool ServerExhausted() const {
+		return no_more_fetches;
+	}
+
 private:
 	//! Register fetch tasks until the batches in flight and in the buffer reach `depth`. Each task
 	//! names its batch and holds its own payload, so a transport retry asks for the SAME batch.

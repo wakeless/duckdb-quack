@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <queue>
 #include <thread>
 
@@ -31,15 +32,17 @@ class ErrorData;
 
 enum class QuackQueryState : uint8_t { IDLE, ACTIVE, FINISHED, CANCELLED, QUACK_ERROR };
 
-//! The stream the connection's active query fills, one at a time. The query runs on a background
-//! thread with a rebalancing result collector, and the FETCH handlers drain the stream's buffer.
+//! One result a client has PREPAREd and may still FETCH. The query runs on a background thread with a
+//! rebalancing result collector, and the FETCH handlers drain the stream's buffer.
 struct QuackStatementState {
-	mutex lock;
 	shared_ptr<QuackResultStream> stream;
 	std::thread thread;
 	hugeint_t uuid = 0;
 	//! A late FETCH for this uuid gets this error. The stream and its payloads can then go away.
 	ErrorData abort_error;
+	//! prepare_count when the client saw the end of this result, or it was aborted. The entry is released
+	//! two PREPAREs later, so a parallel scan's racing final FETCH still finds its answer.
+	optional_idx exhausted_at;
 };
 
 struct QuackConnection {
@@ -54,7 +57,8 @@ struct QuackConnection {
 	//! Guards the session state below and the result cache. Never held across a statement.
 	mutex lock;
 	//! Held for a whole statement, because `duckdb_connection` runs one at a time. Only the query
-	//! driver takes it. Request handlers must not.
+	//! driver takes it. Request handlers must not: a statement PREPAREd while another one still produces
+	//! queues on it, and its PREPARE waits for that one to finish.
 	mutex statement_lock;
 	unique_ptr<Connection> duckdb_connection;
 	//! Replay cache of the last client query's result stream, null unless quack_enable_reconnects.
@@ -96,7 +100,16 @@ struct QuackConnection {
 	atomic<QuackQueryState> query_state {QuackQueryState::IDLE};
 	timestamp_t query_started_at {0};
 
-	QuackStatementState statement;
+	//! Guards `statements`, `running_stream` and `prepare_count`. Never held across a join or a wait.
+	mutex statements_lock;
+	//! Results a client has PREPAREd but not released, keyed by the client-supplied query uuid. Keyed rather
+	//! than single so a query needing two remote scans on one connection can run: the second scan's PREPARE
+	//! must not destroy the first scan's result. Internal traffic (uuid 0) shares the zero key.
+	std::map<hugeint_t, unique_ptr<QuackStatementState>> statements;
+	//! The stream of the statement that holds `statement_lock` right now, null between statements
+	shared_ptr<QuackResultStream> running_stream;
+	//! PREPAREs handled on this connection; anchors the release of exhausted results
+	idx_t prepare_count = 0;
 };
 
 struct QuackConnectionSnapshot {

@@ -180,10 +180,25 @@ struct QuackScanGlobalState : GlobalTableFunctionState {
 	      projection_ids(std::move(projection_id_p)), query_uuid(query_uuid_p),
 	      reconnects_enabled(reconnects_enabled_p), results(std::move(results_p)) {
 	}
+	~QuackScanGlobalState() override {
+		// A scan that stopped early (a LIMIT, or an error upstream) leaves rows unfetched, and the
+		// server holds that result until the session ends - every later statement on the connection
+		// then has to wait for it to finish producing. Tell the server to drop it.
+		if (!fetcher || !client_connection) {
+			return;
+		}
+		auto abandoned = !fetcher->ServerExhausted();
+		// Release the fetcher first: it is holding the pooled clients, and the ack needs one.
+		fetcher.reset();
+		if (abandoned) {
+			client_connection->AcknowledgeResult(query_uuid);
+		}
+	}
 	idx_t MaxThreads() const override {
 		return max_threads;
 	}
 	idx_t max_threads;
+	shared_ptr<QuackClientConnection> client_connection;
 	vector<ColumnIndex> column_ids;
 	vector<idx_t> projection_ids;
 	hugeint_t query_uuid;
@@ -316,6 +331,7 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 	// we only multithread if there is more to fetch
 	auto global_state = make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
 	                                                    needs_more_fetch, query_uuid, ReconnectsEnabled(context));
+	global_state->client_connection = bind_data.client_connection;
 	if (needs_more_fetch) {
 		// start pipelining FETCH requests on the ASYNC pool before the first scan call
 		global_state->fetcher = make_shared_ptr<QuackFetcher>(context, *bind_data.client_connection, query_uuid,

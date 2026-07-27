@@ -132,6 +132,10 @@ public:
 	//! Get a client (either a cached one, or open a new one if required).
 	//! Throws once the server has told us its database is gone - see MarkServerInvalidated.
 	unique_ptr<QuackClientWrapper> GetClient(ClientContext &context) const;
+	//! Acknowledge a result the client will not fetch any further, so the server can drop it.
+	//! Best-effort and safe to call from a destructor: never throws, and skips silently when no
+	//! cached client is available.
+	void AcknowledgeResult(hugeint_t query_uuid) const noexcept;
 	//! Return a client back to the cache
 	void StoreClient(unique_ptr<QuackClient> client_p) const;
 

@@ -14,7 +14,7 @@ class BinaryDeserializer;
 class ClientContext;
 
 //! Quack wire-protocol version. Client and server agree on it during the connection handshake.
-static constexpr idx_t QUACK_VERSION = 3;
+static constexpr idx_t QUACK_VERSION = 5;
 
 //! Upper bound both peers enforce on the heartbeat lease timeout
 static constexpr idx_t MAX_HEARTBEAT_TIMEOUT_SECONDS = static_cast<idx_t>(NumericLimits<int64_t>::Maximum() / 1000);
