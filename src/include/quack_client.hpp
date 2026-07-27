@@ -100,6 +100,10 @@ public:
 
 	//! Get a client (either a cached one, or open a new one if required)
 	unique_ptr<QuackClientWrapper> GetClient(ClientContext &context) const;
+	//! Tell the server a pending result will not be fetched any further and can be dropped.
+	//! Best-effort and safe to call from a destructor: never throws, and skips silently when no
+	//! cached client is available.
+	void CloseResult(hugeint_t query_uuid) const noexcept;
 	//! Return a client back to the cache
 	void StoreClient(unique_ptr<QuackClient> client_p) const;
 

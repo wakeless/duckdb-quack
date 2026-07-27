@@ -260,6 +260,25 @@ unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &c
 	return make_uniq<QuackClientWrapper>(std::move(result), shared_from_this());
 }
 
+void QuackClientConnection::CloseResult(hugeint_t query_uuid) const noexcept {
+	try {
+		unique_ptr<QuackClient> client;
+		{
+			lock_guard<mutex> guard(lock);
+			if (cached_clients.empty()) {
+				// Nothing warm to send on; the server drops the result when the session ends.
+				return;
+			}
+			client = std::move(cached_clients.back());
+			cached_clients.pop_back();
+		}
+		client->Request<SuccessResponse>(nullptr, make_uniq<CloseResultRequestMessage>(ConnectionId(), query_uuid));
+		StoreClient(std::move(client));
+	} catch (...) {
+		// Best effort: the result is dropped when the session ends anyway.
+	}
+}
+
 void QuackClientConnection::StoreClient(unique_ptr<QuackClient> client_p) const {
 	lock_guard<mutex> guard(lock);
 	if (cached_clients.size() >= max_connections_cached) {

@@ -9,7 +9,7 @@
 namespace duckdb {
 
 //! Quack wire-protocol version. Client and server agree on it during the connection handshake.
-static constexpr idx_t QUACK_VERSION = 2;
+static constexpr idx_t QUACK_VERSION = 3;
 
 enum class MessageType : uint8_t {
 	INVALID = 0,
@@ -26,7 +26,11 @@ enum class MessageType : uint8_t {
 	FINALIZE = 13,
 	SEND_DATA_RESPONSE = 14,
 	ACKNOWLEDGEMENT = 15,
-	ERROR_RESPONSE = 100
+	ERROR_RESPONSE = 100,
+	// 200+ is reserved for message types added downstream of upstream quack. Upstream appends
+	// to the sequential block above, so anything we add there collides on the next merge; keep
+	// our additions here until they are upstreamed and can take a normal low number.
+	CLOSE_RESULT_REQUEST = 200
 };
 
 template <>
@@ -526,6 +530,28 @@ protected:
 
 private:
 	ErrorData error;
+};
+
+//! Tells the server a pending result will not be fetched any further, so it can drop it.
+//! Without this a client that abandons a scan (a LIMIT that stops early) leaves the result
+//! pending for the life of the connection, and every later query on that connection pays to
+//! drain it out of the way of the live stream.
+class CloseResultRequestMessage : public QuackMessage {
+public:
+	static constexpr MessageType TYPE = MessageType::CLOSE_RESULT_REQUEST;
+
+	explicit CloseResultRequestMessage(string connection_id_p, hugeint_t query_uuid_p)
+	    : QuackMessage(TYPE, std::move(connection_id_p)), query_uuid(query_uuid_p) {
+	}
+
+	void Serialize(Serializer &serializer) const override;
+	static unique_ptr<CloseResultRequestMessage> Deserialize(Deserializer &deserializer);
+
+	hugeint_t query_uuid;
+
+protected:
+	CloseResultRequestMessage() : QuackMessage(TYPE) {
+	}
 };
 
 class CancelRequestMessage : public QuackMessage {

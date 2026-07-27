@@ -8,6 +8,10 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/common/types/column/column_data_scan_states.hpp"
+#include "duckdb/common/error_data.hpp"
+#include <map>
 
 #include "quack_uri.hpp"
 
@@ -61,15 +65,36 @@ struct QuackInsertState {
 	shared_ptr<QuackDataStream> StreamForDeadRangeOrBuffer(const string &sid, idx_t lo, idx_t hi);
 };
 
+//! A result a client has PREPAREd but not yet fully fetched. At most one result per connection
+//! holds a `live` streaming result (the underlying DuckDB connection supports only one); when
+//! another query needs the connection, the live result is drained into `buffered` (a
+//! buffer-managed collection that can spill to disk) and served from there.
+struct QuackPendingResult {
+	//! Live streaming result (exclusive with `buffered`)
+	unique_ptr<QueryResult> live;
+	//! Result drained out of the way of a later query; remaining batches are served from here
+	unique_ptr<ColumnDataCollection> buffered;
+	ColumnDataScanState buffered_scan;
+	//! Error raised while draining `live`; reported on the next FETCH of this result
+	ErrorData error;
+	//! Monotonic counter assigned per FETCH batch, per result — order-preserving parallel scans
+	//! need indices that do not interleave with another concurrent result's
+	idx_t next_batch_index = 1;
+	//! Set once every row has been served: the prepare_count at exhaustion time (see cleanup)
+	optional_idx exhausted_at;
+};
+
 struct QuackConnection {
 	explicit QuackConnection(string session_id_p);
 	~QuackConnection();
 
 	mutex lock;
 	unique_ptr<Connection> duckdb_connection;
-	unique_ptr<QueryResult> duckdb_query_result;
-	//! Monotonic counter assigned per FETCH batch — enables order-preserving parallel scans on
-	idx_t next_batch_index = 1;
+	//! Pending results keyed by the client-supplied query UUID. Keyed rather than single so a
+	//! query needing two remote scans on one connection can run.
+	map<hugeint_t, QuackPendingResult> pending_results;
+	//! Number of PREPAREs handled on this connection; drives exhausted-result cleanup
+	idx_t prepare_count = 0;
 	//! Current query UUID
 	hugeint_t query_uuid;
 	string session_id;

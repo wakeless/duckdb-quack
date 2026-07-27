@@ -1,0 +1,128 @@
+# name: test/sql/multi_pending_results.test
+# description: one query may stream several remote results on a single connection
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# Small batches so every remote scan needs more than one FETCH: the results have to stay
+# pending on the connection at the same time, which is the case a single-result server broke.
+statement ok quack_db:quack_server_con
+set global quack_fetch_batch_rows = 64;
+
+statement ok quack_db:quack_server_con
+create table t1 as select range i from range(1000);
+
+statement ok quack_db:quack_server_con
+create table t2 as select range i from range(1000);
+
+statement ok quack_db:quack_server_con
+create view v1 as from t1;
+
+statement ok quack_db:quack_server_con
+create view v2 as from t2;
+
+# Large enough that the client's FETCH read-ahead cannot drain it during a 5-row query, so
+# rows really are left pending server-side when the scan is abandoned below.
+statement ok quack_db:quack_server_con
+create view v_big as select range i from range(500000);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+statement ok
+create table local_t as select range i from range(10);
+
+# ---------------------------------------------------------------------------
+# Two remote relations in one query. The local leg keeps the whole union from being
+# shipped to the server as a single node, so the client really does run two scans.
+# ---------------------------------------------------------------------------
+
+query I
+select count(*) from (
+  select i from remote.main.v1
+  union all
+  select i from local_t
+  union all
+  select i from remote.main.v2
+);
+----
+2010
+
+query II
+select count(*), sum(i) from (
+  select i from remote.main.v1
+  union all
+  select i from remote.main.v2
+);
+----
+2000	999000
+
+# a join across two remote relations, with a local leg to keep it client-side
+query I
+select count(*) from remote.main.v1 a join remote.main.v2 b on a.i = b.i
+where a.i in (select i from local_t);
+----
+10
+
+# ---------------------------------------------------------------------------
+# Materialising a partially-fetched remote result must not disturb the others:
+# a CTAS runs an INSERT, which takes over the server's DuckDB connection.
+# ---------------------------------------------------------------------------
+
+statement ok
+create table copy_v1 as select i from remote.main.v1;
+
+query II
+select count(*), sum(i) from copy_v1;
+----
+1000	499500
+
+# both remote relations still read correctly afterwards
+query II
+select count(*), sum(i) from (
+  select i from remote.main.v1
+  union all
+  select i from remote.main.v2
+);
+----
+2000	999000
+
+# ---------------------------------------------------------------------------
+# An abandoned scan tells the server to drop its result (CLOSE_RESULT), so it does
+# not sit pending for the life of the connection.
+# ---------------------------------------------------------------------------
+
+statement ok
+call enable_logging('Quack');
+
+# The LIMIT sits above a union, so it is not pushed into the remote leg: the server streams
+# v_big while the client stops after 5 rows, leaving most of the result pending.
+query I
+select count(*) from (
+  select i from (select i from remote.main.v_big union all select i from local_t) limit 5
+);
+----
+5
+
+# the client really told the server to drop the result rather than leaving it pending
+query I
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CLOSE_RESULT_REQUEST';
+----
+true
+
+statement ok
+call disable_logging();
+
+# the connection keeps working after an abandoned scan
+query II
+select count(*), sum(i) from remote.main.v2;
+----
+1000	499500
+
+statement ok
+detach remote;
+
+include test/template/quack_teardown.test_template

@@ -194,6 +194,16 @@
     ]
   },
   {
+    "class": "CloseResultRequestMessage",
+    "members": [
+      {
+        "id": 1,
+        "name": "query_uuid",
+        "type": "hugeint_t"
+      }
+    ]
+  },
+  {
     "class": "CancelRequestMessage",
     "members": [
       {

@@ -89,6 +89,12 @@ public:
 	//! Stop topping up and drain all in-flight fetches; errors were already surfaced through the buffer.
 	void StopAndDrain();
 
+	//! Whether the server reported the result exhausted (an empty FETCH). False means rows remain
+	//! server-side, so an abandoned scan should tell the server to drop the result.
+	bool ServerExhausted() const {
+		return no_more_fetches;
+	}
+
 private:
 	//! Register fetch tasks until in-flight + buffered batches reach `depth`.
 	void TopUp();
