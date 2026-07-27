@@ -72,6 +72,12 @@
         "name": "inline_rows",
         "type": "optional_idx",
         "default": "optional_idx()"
+      },
+      {
+        "id": 4,
+        "name": "prepare_only",
+        "type": "bool",
+        "default": "false"
       }
     ]
   },

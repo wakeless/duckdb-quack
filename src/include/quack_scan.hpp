@@ -11,13 +11,14 @@ struct QuackScanBindData : FunctionData {
 		auto &other = other_p.Cast<QuackScanBindData>();
 		return other.client_connection->ConnectionId() == client_connection->ConnectionId() &&
 		       other.client_connection->ServerURI() == client_connection->ServerURI() &&
-		       other.qualified_table_name == qualified_table_name && other.column_names == column_names &&
-		       other.column_types == column_types;
+		       other.qualified_table_name == qualified_table_name && other.remote_query == remote_query &&
+		       other.column_names == column_names && other.column_types == column_types;
 	}
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<QuackScanBindData>();
 		result->client_connection = client_connection;
 		result->qualified_table_name = qualified_table_name;
+		result->remote_query = remote_query;
 		result->column_names = column_names;
 		result->column_types = column_types;
 		return std::move(result);
@@ -26,12 +27,18 @@ struct QuackScanBindData : FunctionData {
 	//! The table to scan, qualified the way the remote server sees it (e.g. s1.child.t). Empty when this
 	//! scan does not read a catalog table but the result of a query
 	QualifiedName qualified_table_name;
+	//! The raw query text sent to the server (by-name scans only; empty on the catalog path)
+	string remote_query;
 	vector<Identifier> column_names;
 	vector<LogicalType> column_types;
 	vector<unique_ptr<DataChunkWrapper>> results;
 	shared_ptr<QuackClientConnection> client_connection;
 	optional_ptr<TableCatalogEntry> table_entry;
 	bool needs_more_fetch = true;
+	//! Whether the bind-time result is still unfetched. A rewrite that produces no new query
+	//! replays those chunks; once consumed (a re-executed prepared statement) the original query
+	//! must be re-issued instead of replaying a result that is no longer there.
+	bool has_unconsumed_bind_result = false;
 	hugeint_t query_uuid;
 	atomic<bool> completed;
 
