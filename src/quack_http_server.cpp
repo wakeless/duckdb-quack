@@ -224,8 +224,18 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 
 	server->Post("/quack", [&](const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
 	                           const duckdb_httplib::ContentReader &content_reader) {
-		RecordRequest(req.remote_port);
 		res.set_header("Access-Control-Allow-Origin", "*");
+		if (server_state == QuackServerState::CLOSED) {
+			// Stopping only closes the listening socket: httplib serves a request that is
+			// already pending on an established keep-alive connection without rechecking
+			// the listener, so a client holding one open would keep talking to a server
+			// that has been stopped. Refuse instead. 503 is retryable, so the client drops
+			// this connection and re-dials - reaching whatever now owns the port.
+			res.status = 503;
+			res.set_content("This Quack RPC endpoint has been stopped.\n", "text/plain");
+			return;
+		}
+		RecordRequest(req.remote_port);
 		MemoryStream stream;
 		content_reader([&](const char *data, size_t data_length) {
 			stream.WriteData((data_ptr_t)data, data_length);

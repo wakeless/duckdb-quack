@@ -1,0 +1,73 @@
+# name: test/sql/keepalive.test
+# description: a client holds its transport connection open across requests
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t as select range i from range(10);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+# several statements over the one attachment
+query I
+select count(*) from remote.main.t;
+----
+10
+
+query I
+select sum(i) from remote.main.t;
+----
+45
+
+query I
+select min(i) from remote.main.t;
+----
+0
+
+# the point: many requests were served, but they shared connections
+query I quack_db:quack_server_con
+select info['client_requests']::BIGINT > info['client_connections']::BIGINT from quack_server_list();
+----
+true
+
+# pin down how few. one client session holds one connection, so everything so far
+# (the handshake, the catalog load and every statement) rode a single connection
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT from quack_server_list();
+----
+1
+
+# and further statements add no connections at all
+statement ok quack_db:quack_server_con
+set variable before = (select info['client_connections']::BIGINT from quack_server_list());
+
+query I
+select count(*) from remote.main.t;
+----
+10
+
+query I
+select sum(i) from remote.main.t;
+----
+45
+
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('before') from quack_server_list();
+----
+0
+
+# requests did keep flowing - the counter above is not just frozen
+query I quack_db:quack_server_con
+select info['client_requests']::BIGINT >= 8 from quack_server_list();
+----
+true
+
+statement ok
+detach remote;
+
+include test/template/quack_teardown.test_template
