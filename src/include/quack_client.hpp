@@ -142,7 +142,8 @@ private:
 private:
 	unique_ptr<HTTPParams> http_params;
 	//! Persistent keep-alive HTTP client: reused across requests so the TCP connection (and its
-	//! warm congestion window) survives between POSTs; replaced by the retry path on dead sockets.
+	//! warm congestion window) survives between POSTs; replaced by the retry path on dead sockets,
+	//! and dropped here when a request fails, since it may be left mid-exchange.
 	unique_ptr<HTTPClient> http_client;
 };
 

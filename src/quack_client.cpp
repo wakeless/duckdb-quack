@@ -86,10 +86,13 @@ string HttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size) {
 	try {
 		response = http_util.Request(post_request, http_client);
 	} catch (std::exception &ex) {
+		// the connection may be half-way through a request - do not hand it to the next one
+		http_client.reset();
 		ErrorData error(ex);
 		throw IOException("Failed to send message: %s", error.Message());
 	}
 	if (!response || !response->Success()) {
+		http_client.reset();
 		string error = response ? response->GetError() : "no response";
 		throw IOException("Failed to send message: %s", error);
 	}

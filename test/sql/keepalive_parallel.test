@@ -1,0 +1,71 @@
+# name: test/sql/keepalive_parallel.test
+# description: a parallel scan's connections are reused by the next scan
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# Small FETCH batches so a scan needs many round trips and runs multi-threaded. An
+# aggregate would be pushed to the server and come back as a single row, so these scans
+# stream every row to the client instead. Set before the ATTACH deliberately: the catalog
+# loads on first use, under this batch size, so this also covers the load draining its
+# result rather than truncating to the first batch.
+statement ok quack_db:quack_server_con
+set global quack_fetch_batch_rows = 1;
+
+statement ok quack_db:quack_server_con
+create table big as select range i, ('x' || range) s from range(200000);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+set threads = 4;
+
+statement ok
+attach {server} as remote
+
+statement ok
+create table copy1 as select * from remote.main.big;
+
+query I
+select count(*) from copy1;
+----
+200000
+
+# whatever connections that scan's threads took, they went back to the session cache
+statement ok quack_db:quack_server_con
+set variable after_first = (select info['client_connections']::BIGINT from quack_server_list());
+
+statement ok
+create table copy2 as select * from remote.main.big;
+
+statement ok
+create table copy3 as select * from remote.main.big;
+
+query I
+select count(*) from copy3;
+----
+200000
+
+# Two more scans of the same shape reuse the pool rather than re-dialling per scan. The
+# async pool checks out a varying number of clients per scan, so this bounds the growth
+# instead of demanding exactly zero: a scan that re-dialled per thread, or per request,
+# would blow past this.
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('after_first') <= getvariable('after_first')
+from quack_server_list();
+----
+true
+
+# The decisive ratio. The async pool holds a fair number of connections, so this is not
+# one-connection-per-session; the point is that each carries many requests. Without reuse
+# the two counters move together and the ratio is 1.
+query I quack_db:quack_server_con
+select info['client_requests']::BIGINT > 3 * info['client_connections']::BIGINT from quack_server_list();
+----
+true
+
+statement ok
+detach remote;
+
+include test/template/quack_teardown.test_template

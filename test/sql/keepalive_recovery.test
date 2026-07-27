@@ -1,0 +1,146 @@
+# name: test/sql/keepalive_recovery.test
+# description: a retained transport connection recovers from every way it can go stale
+# group: [sql]
+
+require quack
+
+require httpfs
+
+# a short idle timeout so the graceful-close case below does not need a long sleep
+statement ok quack_db:quack_server_con
+set quack_server_keep_alive_timeout = 1;
+
+statement ok quack_db:quack_server_con
+set variable actual_listen_uri = (select listen_uri from quack_serve('quack:localhost:0', token='asdf'));
+
+query I quack_db:quack_server_con
+set variable listen_uri = concat('''', getvariable('actual_listen_uri'), '''');
+
+set variable server <variable:quack_server_con:listen_uri>
+
+statement ok quack_db:quack_server_con
+create table t as select range i from range(10);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+query I
+select count(*) from remote.main.t;
+----
+10
+
+# ---------------------------------------------------------------------------
+# A failed statement must not poison the connection. The server reports the
+# error in its response body over a perfectly healthy HTTP exchange, so the
+# connection is still good and the next statement should reuse it.
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+set variable before_error = (select info['client_connections']::BIGINT from quack_server_list());
+
+statement error
+select * from quack_query_by_name('remote', 'select * from no_such_table_at_all');
+----
+<REGEX>:.*no_such_table_at_all.*
+
+query I
+select count(*) from remote.main.t;
+----
+10
+
+# the error cost us no new connection: the failing statement and the one after it
+# both rode the connection that was already open
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('before_error') from quack_server_list();
+----
+0
+
+# ---------------------------------------------------------------------------
+# Graceful idle close: with keep_alive_timeout=1 the server sends FIN on the
+# idle connection. The client must notice and re-dial rather than fail.
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+set variable before_idle = (select info['client_connections']::BIGINT from quack_server_list());
+
+sleep 2500 millisecond
+
+query I
+select count(*) from remote.main.t;
+----
+10
+
+# it healed by opening exactly one replacement connection
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('before_idle') from quack_server_list();
+----
+1
+
+# and that replacement is itself reused
+statement ok quack_db:quack_server_con
+set variable after_idle = (select info['client_connections']::BIGINT from quack_server_list());
+
+query I
+select sum(i) from remote.main.t;
+----
+45
+
+query I
+select min(i) from remote.main.t;
+----
+0
+
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('after_idle') from quack_server_list();
+----
+0
+
+# ---------------------------------------------------------------------------
+# DETACH releases the client's connections instead of leaking one per cycle.
+# ---------------------------------------------------------------------------
+
+statement ok
+detach remote;
+
+query I quack_db:quack_server_con
+select active_connections from quack_server_list();
+----
+0
+
+statement ok quack_db:quack_server_con
+set variable before_cycles = (select info['client_connections']::BIGINT from quack_server_list());
+
+# three attach/detach cycles, each doing real work
+loop i 0 3
+
+statement ok
+attach {server} as cycle_{i}
+
+query I
+select count(*) from cycle_{i}.main.t;
+----
+10
+
+statement ok
+detach cycle_{i};
+
+endloop
+
+# every session is gone again
+query I quack_db:quack_server_con
+select active_connections from quack_server_list();
+----
+0
+
+# each cycle is a new client session, so a new connection each - but only one per
+# cycle, not one per request
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT - getvariable('before_cycles') <= 3 from quack_server_list();
+----
+true
+
+statement ok quack_db:quack_server_con
+call quack_stop(getvariable('actual_listen_uri'));
