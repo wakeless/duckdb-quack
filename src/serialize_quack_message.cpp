@@ -147,6 +147,7 @@ void PrepareRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "sql_query", sql_query);
 	serializer.WriteProperty<hugeint_t>(2, "query_uuid", query_uuid);
 	serializer.WritePropertyWithDefault<optional_idx>(3, "inline_rows", inline_rows, optional_idx());
+	serializer.WritePropertyWithDefault<bool>(4, "prepare_only", prepare_only, false);
 }
 
 unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserializer &deserializer) {
@@ -154,6 +155,7 @@ unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserialize
 	deserializer.ReadPropertyWithDefault<string>(1, "sql_query", result->sql_query);
 	deserializer.ReadProperty<hugeint_t>(2, "query_uuid", result->query_uuid);
 	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(3, "inline_rows", result->inline_rows, optional_idx());
+	deserializer.ReadPropertyWithExplicitDefault<bool>(4, "prepare_only", result->prepare_only, false);
 	return result;
 }
 

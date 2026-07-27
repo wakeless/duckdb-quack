@@ -818,6 +818,38 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			connection.query_uuid = query_uuid;
 		}
 
+		if (prepare_request_message.PrepareOnly()) {
+			// Schema-only: bind the query to resolve its result schema without executing it. No statement
+			// is installed, so there is nothing to fetch, release or abort later. The bind takes the
+			// statement lock like a statement would: the DuckDB connection is shared with whatever runs
+			// now, and that statement has just been told to finish.
+			unique_ptr<PreparedStatement> prepared;
+			{
+				lock_guard<mutex> guard(connection.statement_lock);
+				prepared = connection.duckdb_connection->Prepare(effective_sql);
+			}
+			auto fail = [&](ErrorData error) {
+				std::unique_lock<std::mutex> lock(connection.lock);
+				connection.query_state = QuackQueryState::CANCELLED;
+				connection.sql_query = "";
+				return make_uniq<ErrorResponse>(std::move(error));
+			};
+			if (prepared->HasError()) {
+				return fail(prepared->GetErrorObject());
+			}
+			vector<string> names;
+			for (auto &name : prepared->GetNames()) {
+				names.push_back(name.GetIdentifierName());
+			}
+			if (names.empty()) {
+				return fail(ErrorData(ExceptionType::INVALID_INPUT, "Query did not return any columns"));
+			}
+			auto types = prepared->GetTypes();
+			connection.query_state = QuackQueryState::FINISHED;
+			return make_uniq<PrepareResponseMessage>(types, names, vector<unique_ptr<DataChunkWrapper>>(),
+			                                         /*needs_more_fetch=*/false, hugeint_t(0));
+		}
+
 		auto stream = make_shared_ptr<QuackResultStream>();
 		// One buffer exists for each connection, so a fixed size does not suit every server. Core
 		// also sizes an optional buffer at a quarter of the memory limit. 0 still means no limit.
