@@ -103,19 +103,34 @@ string HttpsQuackClient::PostRawLocked(const_data_ptr_t data, idx_t size) {
 	auto &http_util = HTTPUtil::Get(db);
 	auto request_url = uri.Http() + "/quack";
 	HTTPHeaders headers;
-	PostRequestInfo post_request(request_url, headers, *http_params, data, size);
-	unique_ptr<HTTPResponse> response;
-	try {
-		response = http_util.Request(post_request, http_client);
-	} catch (std::exception &ex) {
-		ErrorData error(ex);
-		throw IOException("Failed to send message: %s", error.Message());
+	// A 503 is a stopped server refusing a request on a keep-alive connection it still holds (see
+	// HttpQuackServer): it processed nothing, so re-dial once to reach whatever now owns the port.
+	// The engine only retries idempotent requests, which a POST is not.
+	for (idx_t attempt = 0;; attempt++) {
+		PostRequestInfo post_request(request_url, headers, *http_params, data, size);
+		unique_ptr<HTTPResponse> response;
+		try {
+			response = http_util.Request(post_request, http_client);
+		} catch (std::exception &ex) {
+			// the connection may be half-way through a request - do not hand it to the next one
+			http_client.reset();
+			ErrorData error(ex);
+			auto status = error.ExtraInfo().find("status_code");
+			if (attempt == 0 && status != error.ExtraInfo().end() && status->second == "503") {
+				continue;
+			}
+			throw IOException("Failed to send message: %s", error.Message());
+		}
+		if (!response || !response->Success()) {
+			http_client.reset();
+			if (attempt == 0 && response && response->status == HTTPStatusCode::ServiceUnavailable_503) {
+				continue;
+			}
+			string error = response ? response->GetError() : "no response";
+			throw IOException("Failed to send message: %s", error);
+		}
+		return std::move(post_request.buffer_out);
 	}
-	if (!response || !response->Success()) {
-		string error = response ? response->GetError() : "no response";
-		throw IOException("Failed to send message: %s", error);
-	}
-	return std::move(post_request.buffer_out);
 }
 
 void HttpsQuackClient::EnsureHttpParams(optional_ptr<ClientContext> context) {
