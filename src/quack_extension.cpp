@@ -235,6 +235,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "executor blocks when the client falls this far behind",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT));
 
+	config.AddExtensionOption("quack_assumed_scan_cardinality",
+	                          "Assumed row count for remote scans without a server estimate (0 disables)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+
 	config.AddExtensionOption("quack_server_max_connections",
 	                          "Maximum concurrent connections the RPC server accepts; beyond this new "
 	                          "connections are refused",
