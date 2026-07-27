@@ -134,6 +134,18 @@ include test/template/quack_teardown.test_template
 # before asserting a fresh attach to the same address fails.
 sleep 2 seconds
 
-statement error
+# the server is gone. A lazy attach cannot know that yet, so the failure lands on
+# first use; an eager one fails at ATTACH.
+statement ok
 attach {server} as rpc
+
+statement error
+from rpc.fuu;
+----
+
+statement ok
+detach rpc
+
+statement error
+attach {server} as rpc_eager (eager_catalog true)
 ----

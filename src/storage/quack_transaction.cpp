@@ -20,9 +20,20 @@ void QuackTransaction::Start() {
 }
 
 void QuackTransaction::ForceStart() {
-	if (transaction_state == QuackTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = QuackTransactionState::TRANSACTION_STARTED;
+	if (transaction_state != QuackTransactionState::TRANSACTION_NOT_YET_STARTED) {
+		return;
+	}
+	// mark started before issuing the BEGIN so the Query() below does not recurse back here
+	transaction_state = QuackTransactionState::TRANSACTION_STARTED;
+	try {
 		Query("BEGIN TRANSACTION");
+	} catch (...) {
+		// No remote transaction was opened - the server may be unreachable, or the catalog may
+		// have failed to load on first use. Roll the state back so the COMMIT/ROLLBACK that
+		// follows does not try to close a transaction that never existed and turn a plain
+		// error into a fatal one.
+		transaction_state = QuackTransactionState::TRANSACTION_NOT_YET_STARTED;
+		throw;
 	}
 }
 

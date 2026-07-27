@@ -22,6 +22,11 @@ create secret (type quack, token 'asdf')
 statement ok
 attach {server} as rpc
 
+# resolve the catalog before logging starts: it loads on first use, and its handshake
+# plus catalog queries would otherwise be counted alongside the loop's messages
+statement ok
+from rpc.pgbench_accounts limit 0;
+
 statement ok
 CALL enable_logging('Quack');
 

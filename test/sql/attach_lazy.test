@@ -1,0 +1,149 @@
+# name: test/sql/attach_lazy.test
+# description: ATTACH does not talk to the server until the catalog is actually used
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t as select range i from range(10);
+
+statement ok quack_db:quack_server_con
+create schema other;
+
+statement ok quack_db:quack_server_con
+create table other.u as select 'hello' as greeting;
+
+statement ok
+create secret (type quack, token 'asdf')
+
+# ---------------------------------------------------------------------------
+# ATTACH is free: no handshake, no catalog snapshot, no connection opened.
+# ---------------------------------------------------------------------------
+
+statement ok
+call enable_logging('Quack');
+
+statement ok
+attach {server} as lazy_db
+
+query I
+select count(*) from duckdb_logs_parsed('Quack');
+----
+0
+
+query I quack_db:quack_server_con
+select info['client_connections']::BIGINT from quack_server_list();
+----
+0
+
+# duckdb_databases() reports the attachment without forcing it to load
+query I
+select count(*) from duckdb_databases() where database_name = 'lazy_db';
+----
+1
+
+query I
+select count(*) from duckdb_logs_parsed('Quack');
+----
+0
+
+# clearing caches before first use is a no-op rather than a load
+statement ok
+call quack_clear_cache();
+
+query I
+select count(*) from duckdb_logs_parsed('Quack');
+----
+0
+
+# ---------------------------------------------------------------------------
+# The first real use loads the catalog, once.
+# ---------------------------------------------------------------------------
+
+query I
+select count(*) from lazy_db.main.t;
+----
+10
+
+query I
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+1
+
+statement ok
+call truncate_duckdb_logs();
+
+# the catalog is loaded now: further queries neither re-handshake nor re-snapshot
+query I
+select greeting from lazy_db.other.u;
+----
+hello
+
+query I
+select count(*) from lazy_db.main.t;
+----
+10
+
+query I
+select count(*) from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+0
+
+statement ok
+call disable_logging();
+
+statement ok
+detach lazy_db;
+
+# ---------------------------------------------------------------------------
+# eager_catalog restores the old behaviour for callers that want ATTACH to
+# prove the server is reachable.
+# ---------------------------------------------------------------------------
+
+statement ok
+call truncate_duckdb_logs();
+
+statement ok
+call enable_logging('Quack');
+
+statement ok
+attach {server} as eager_db (eager_catalog true)
+
+query I
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+true
+
+query I
+select count(*) from eager_db.main.t;
+----
+10
+
+statement ok
+call disable_logging();
+
+statement ok
+detach eager_db;
+
+# ---------------------------------------------------------------------------
+# The cost of laziness: a bad token is not reported until first use.
+# ---------------------------------------------------------------------------
+
+statement ok
+attach {server} as bad_db (token 'wrongtoken')
+
+statement error
+select count(*) from bad_db.main.t;
+----
+<REGEX>:.*(Invalid|auth|token|connect).*
+
+statement ok
+detach bad_db;
+
+# eagerly, the same mistake fails at ATTACH
+statement error
+attach {server} as bad_eager (token 'wrongtoken', eager_catalog true)
+----
+<REGEX>:.*(Invalid|auth|token|connect).*
+
+include test/template/quack_teardown.test_template

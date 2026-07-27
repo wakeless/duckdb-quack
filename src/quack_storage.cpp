@@ -105,7 +105,18 @@ static unique_ptr<Catalog> QuackAttach(optional_ptr<StorageExtensionInfo> storag
 	auto client_id_entry = attach_options.options.find("client_id");
 	auto client_id = QuackClient::ResolveClientId(
 	    context, client_id_entry != attach_options.options.end() ? &client_id_entry->second : nullptr);
-	return make_uniq<QuackCatalog>(db, QuackUri(uri, enable_ssl), context, token, std::move(client_id));
+	// ConnectToServer validates too, but that is deferred to first use now: a malformed client_id
+	// is a purely local mistake, so reject it while the user is still looking at the ATTACH.
+	QuackClient::ValidateClientId(client_id);
+	// By default the catalog is fetched on first use, so attaching a server that is never
+	// queried costs nothing. Opting in to an eager load makes ATTACH itself verify that the
+	// server is reachable and the token is accepted.
+	bool eager_catalog = false;
+	if (attach_options.options.find("eager_catalog") != attach_options.options.end()) {
+		eager_catalog = attach_options.options["eager_catalog"].GetValue<bool>();
+	}
+	return make_uniq<QuackCatalog>(db, QuackUri(uri, enable_ssl), context, token, std::move(client_id),
+	                               eager_catalog);
 }
 
 static unique_ptr<TransactionManager> QuackCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,

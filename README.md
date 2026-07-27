@@ -46,6 +46,28 @@ CREATE TABLE remote.hello2 AS FROM VALUES ('world2') v(s);
 FROM hello2;
 ```
 
+### Connecting lazily
+
+`ATTACH` does not contact the server. The session handshake and the catalog snapshot happen the
+first time the attachment is used, so attaching a server you never query costs nothing — which
+matters for connection pools that re-run their initialisation SQL on every new pooled connection.
+
+The trade-off is that an unreachable server or a rejected token is reported by the first query
+rather than by `ATTACH`. Pass `eager_catalog` to connect straight away:
+
+```sql
+ATTACH 'quack:localhost' AS remote (EAGER_CATALOG true);
+```
+
+Because the token is resolved on first use, a secret created after `ATTACH` is still picked up —
+and one dropped before first use will break an attachment that looked fine.
+
+### Observing connection reuse
+
+`quack_server_list()` reports `client_connections` and `client_requests` in its `info` map. Clients
+hold their transport connections open across requests, so requests should climb far faster than
+connections; the two rising together means something is reconnecting for every request.
+
 ## Development
 
 ### Managing dependencies
