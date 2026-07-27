@@ -5,6 +5,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/valid_checker.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/temporary_file_manager.hpp"
@@ -824,9 +825,27 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			// statement lock like a statement would: the DuckDB connection is shared with whatever runs
 			// now, and that statement has just been told to finish.
 			unique_ptr<PreparedStatement> prepared;
+			idx_t estimated_cardinality = 0;
 			{
 				lock_guard<mutex> guard(connection.statement_lock);
 				prepared = connection.duckdb_connection->Prepare(effective_sql);
+				if (!prepared->HasError()) {
+					// The planner already sized this query; ship its estimate so the client's optimizer does
+					// not fall back to a 1-row default for the remote relation. EstimateCardinality on the
+					// optimized logical root is the same call the physical planner makes to fill in the
+					// physical root's estimate, so this is that number rather than an approximation of it.
+					// It costs a second planning pass: ExtractPlan carries no column names, so it cannot
+					// replace the Prepare above, which is what resolves the schema this response is for.
+					try {
+						auto plan = connection.duckdb_connection->ExtractPlan(effective_sql);
+						if (plan) {
+							estimated_cardinality = plan->EstimateCardinality(*connection.duckdb_connection->context);
+						}
+					} catch (...) {
+						// A query we cannot size is not a query we should refuse to bind; 0 means "no
+						// estimate" and the client falls back to its own default.
+					}
+				}
 			}
 			auto fail = [&](ErrorData error) {
 				std::unique_lock<std::mutex> lock(connection.lock);
@@ -847,7 +866,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			auto types = prepared->GetTypes();
 			connection.query_state = QuackQueryState::FINISHED;
 			return make_uniq<PrepareResponseMessage>(types, names, vector<unique_ptr<DataChunkWrapper>>(),
-			                                         /*needs_more_fetch=*/false, hugeint_t(0));
+			                                         /*needs_more_fetch=*/false, hugeint_t(0), estimated_cardinality);
 		}
 
 		auto stream = make_shared_ptr<QuackResultStream>();
