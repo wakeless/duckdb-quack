@@ -54,23 +54,19 @@ void GatherQuackScans(LogicalOperator &op, QuackOperators &result) {
 }
 
 void QuackOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	// look at the query plan and check if we can enable streaming query scans
 	QuackOperators operators;
 	GatherQuackScans(*plan, operators);
-	if (operators.op_info.empty()) {
-		// no scans
-		return;
-	}
 	for (auto &entry : operators.op_info) {
 		auto &op_info = entry.second;
-		auto multiple_scans = (op_info.scans.size() + op_info.insert_count) > 1;
-		if (!multiple_scans) {
+		// Several scans on one connection are fine: the server keeps a result per scan. A scan feeding an
+		// INSERT or CTAS on the same connection is not. The INSERT statement holds the server's DuckDB
+		// connection while it waits for the client's batches, so the scan's statement would queue behind
+		// it for rows that can only come out of that scan.
+		if (op_info.insert_count == 0 || op_info.scans.empty()) {
 			continue;
 		}
-		for (auto &_ : op_info.scans) {
-			throw NotImplementedException("Multiple streaming scans or streaming scans + CTAS / insert in the same "
-			                              "query are not currently supported");
-		}
+		throw NotImplementedException(
+		    "A streaming scan feeding a CTAS / insert on the same connection is not currently supported");
 	}
 }
 

@@ -121,6 +121,14 @@ struct QuackResultStream {
 		return retained_rows;
 	}
 
+	//! Stop retaining from now on, but keep what is held: the acks release it as the client confirms
+	//! each batch, so a transport retry still gets its batch. For a cache displaced while the stream
+	//! is still serving.
+	void StopRetaining() {
+		lock_guard<mutex> guard(serve_lock);
+		retain_all = false;
+	}
+
 	//! Stop retaining and drop what is held. The result grew past the cache limit.
 	void DropRetention() {
 		lock_guard<mutex> guard(serve_lock);

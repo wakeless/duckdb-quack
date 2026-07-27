@@ -1,0 +1,57 @@
+# name: test/sql/concurrent_result_batches.test
+# description: two results streaming on one connection each serve their own batches intact
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+# Small batches, so each side needs many FETCHes and both results are still pending while the
+# other scan runs. The VARCHAR carries an auxiliary string heap alongside the fixed-width column,
+# so a batch handed the wrong buffers shows up as a mismatched string.
+statement ok quack_db:quack_server_con
+set global quack_prepare_inline_rows = 1;
+
+statement ok quack_db:quack_server_con
+set global quack_target_batch_bytes = 65536;
+
+statement ok quack_db:quack_server_con
+create table wide_a as select range i, ('row-' || range) s from range(60000);
+
+statement ok quack_db:quack_server_con
+create table wide_b as select range i, ('row-' || range) s from range(60000);
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+# Local join partners keep the aggregates client-side: absorbed into the remote query they would
+# come back as a single row and nothing would ever stream.
+statement ok
+create table local_all as select range i from range(60000);
+
+# Two remote scans on one connection, both streaming more than a batch: whichever PREPAREs second
+# makes the first finish into the server's buffer, and both stream to completion from there.
+query II
+select count(*), sum(i) from (
+  select w.i, w.s from remote.main.wide_a w join local_all l on w.i = l.i
+  union all
+  select w.i, w.s from remote.main.wide_b w join local_all l on w.i = l.i
+);
+----
+120000	3599940000
+
+# every string still matches its own row's integer, rather than another batch's
+query I
+select count(*) from (
+  select w.i, w.s from remote.main.wide_a w join local_all l on w.i = l.i
+  union all
+  select w.i, w.s from remote.main.wide_b w join local_all l on w.i = l.i
+) where s = 'row-' || i::varchar;
+----
+120000
+
+statement ok
+DETACH remote;
+
+include test/template/quack_teardown.test_template

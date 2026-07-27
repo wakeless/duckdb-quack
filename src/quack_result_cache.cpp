@@ -55,8 +55,10 @@ unique_ptr<QuackResultCache> ExpireCacheIfStale(QuackConnection &connection, tim
 		return nullptr;
 	}
 	// an expired unfinished stream must fail loudly on later fetches instead of silently truncating
-	if (cache->query_uuid == connection.query_uuid && cache->stream && !cache->stream->buffer.Exhausted()) {
-		connection.query_state = QuackQueryState::CANCELLED;
+	if (cache->stream && !cache->stream->buffer.Exhausted()) {
+		if (cache->query_uuid == connection.query_uuid) {
+			connection.query_state = QuackQueryState::CANCELLED;
+		}
 		still_serving = true;
 	}
 	auto doomed = std::move(connection.result_cache);

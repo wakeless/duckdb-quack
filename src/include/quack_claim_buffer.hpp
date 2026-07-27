@@ -68,6 +68,22 @@ public:
 		capacity = bytes;
 	}
 
+	//! Drop the limit and wake the producers parked on it, so the stream finishes into memory. For a
+	//! result that must get out of the way of the next statement on its connection.
+	void LiftCapacity() {
+		vector<InterruptState> capacity_wakes;
+		{
+			annotated_lock_guard<annotated_mutex> guard(lock);
+			if (capacity == 0) {
+				return;
+			}
+			capacity = 0;
+			capacity_wakes = TakeCapacityWaiters();
+		}
+		cv.notify_all();
+		WakeCapacity(capacity_wakes);
+	}
+
 	//! Publish a batch under its dense index. The call waits until the batch fits. An empty buffer
 	//! and the head of the stream always admit one, so the producer cannot deadlock.
 	void PushBatch(idx_t batch_index, PAYLOAD payload, idx_t bytes = 0) {

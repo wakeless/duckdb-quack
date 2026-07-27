@@ -1,0 +1,51 @@
+# name: test/sql/two_consumers.test
+# description: two aggregate branches over one CTE of a union view carrying a remote leg
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table au_local as select range i, ('au-' || range) s from range(120000);
+
+# The server is also a client of itself, so the union view below carries a genuine remote leg
+# the way the production main.* views carry remote_uk.
+statement ok quack_db:quack_server_con
+create secret (type quack, token 'asdf');
+
+statement ok quack_db:quack_server_con
+attach {server} as remote_uk (type quack);
+
+statement ok quack_db:quack_server_con
+create view u as
+  select i, s, 'au' src from au_local
+  union all
+  select i, s, 'uk' src from remote_uk.main.au_local;
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+statement ok
+create table local_all as select range i from range(120000);
+
+query III
+with base as (
+  select u.i, u.s, u.src from remote.main.u u join local_all l on u.i = l.i
+)
+select 'a' k, count(*) c, sum(i) t from base
+union all
+select 'b' k, count(*) c, sum(i) t from base
+order by k;
+----
+a	240000	14399880000
+b	240000	14399880000
+
+statement ok
+DETACH remote;
+
+statement ok quack_db:quack_server_con
+DETACH remote_uk;
+
+include test/template/quack_teardown.test_template
