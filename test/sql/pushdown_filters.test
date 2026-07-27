@@ -1,0 +1,109 @@
+# name: test/sql/pushdown_filters.test
+# description: filters are shipped to the server, and scans carry the server's row estimate
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t as select range i, ('x' || (range % 7)) s, (range % 2 = 0) flag from range(1000);
+
+statement ok quack_db:quack_server_con
+create view v as from t;
+
+statement ok
+create secret (type quack, token 'asdf')
+
+statement ok
+attach {server} as remote
+
+# ---------------------------------------------------------------------------
+# Filters reach the server as SQL rather than being applied client-side.
+# ---------------------------------------------------------------------------
+
+statement ok
+call enable_logging('Quack');
+
+query I
+select count(*) from remote.main.t where i > 900;
+----
+99
+
+query I
+select count(*) > 0 from duckdb_logs_parsed('Quack') where query like '%WHERE%i > 900%';
+----
+true
+
+statement ok
+call truncate_duckdb_logs();
+
+# a filter on a string column, and one the planner splits into two conjuncts
+query I
+select count(*) from remote.main.t where s = 'x3';
+----
+143
+
+query I
+select count(*) from duckdb_logs_parsed('Quack') where query like '%WHERE%' and query like '%x3%';
+----
+1
+
+statement ok
+call disable_logging();
+
+# results stay correct with pushdown active
+query III
+select count(*), min(i), max(i) from remote.main.t where i between 100 and 199;
+----
+100	100	199
+
+query I
+select count(*) from remote.main.t where flag and i < 100;
+----
+50
+
+# a filter-only column need not be in the output: filter_prune keeps it out of the SELECT
+query I
+select count(*) from (select i from remote.main.t where s = 'x1');
+----
+143
+
+# ---------------------------------------------------------------------------
+# The scan reports the server's row estimate instead of the 1-row default.
+# ---------------------------------------------------------------------------
+
+statement ok quack_db:quack_server_con
+create view v_big as select range i from range(250000);
+
+query I
+select count(*) from quack_query_by_name('remote', 'from v_big', eager := false);
+----
+250000
+
+# without the server's estimate the optimizer would size this scan at one row
+query II
+explain select * from quack_query_by_name('remote', 'from v_big', eager := false);
+----
+physical_plan	<REGEX>:.*Quack Query By Name.*~250,000 [Rr]ows.*
+
+# an eager bind gets no server estimate, so the configured assumption applies instead
+statement ok
+set quack_assumed_scan_cardinality = 12345;
+
+query II
+explain select * from quack_query_by_name('remote', 'from v_big', eager := true);
+----
+physical_plan	<REGEX>:.*Quack Query By Name.*~12,345 [Rr]ows.*
+
+# 0 disables the assumption, back to the engine default
+statement ok
+set quack_assumed_scan_cardinality = 0;
+
+query II
+explain select * from quack_query_by_name('remote', 'from v_big', eager := true);
+----
+physical_plan	<REGEX>:.*Quack Query By Name.*~1 [Rr]ows?.*
+
+statement ok
+detach remote;
+
+include test/template/quack_teardown.test_template

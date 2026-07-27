@@ -102,6 +102,12 @@
         "id": 5,
         "name": "query_uuid",
         "type": "hugeint_t"
+      },
+      {
+        "id": 6,
+        "name": "estimated_cardinality",
+        "type": "idx_t",
+        "default": "0"
       }
     ],
     "constructor": ["result_types", "result_names",  "results", "needs_more_fetch", "query_uuid"]

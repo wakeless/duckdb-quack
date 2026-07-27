@@ -3,9 +3,11 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/table_filter_set.hpp"
 
 #include "quack_scan.hpp"
+#include "quack_filter_sql.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "quack_client.hpp"
 #include "quack_fetch_ahead.hpp"
 #include "include/storage/quack_catalog.hpp"
@@ -35,6 +37,7 @@ static void CaptureBindResponse(QuackScanBindData &bind_data, PrepareResponseMes
 	bind_data.remote_query = query;
 	bind_data.column_names = names;
 	bind_data.column_types = return_types;
+	bind_data.estimated_cardinality = response.EstimatedCardinality();
 	if (eager) {
 		bind_data.results = std::move(response.MutableResults());
 		bind_data.needs_more_fetch = response.NeedsMoreFetch();
@@ -197,6 +200,9 @@ struct QuackScanGlobalState : GlobalTableFunctionState {
 	}
 	idx_t max_threads;
 	shared_ptr<QuackClientConnection> client_connection;
+	//! Whether the server already applied projection/filters to this result; fetched chunks then
+	//! arrive final instead of needing the client-side projection
+	bool pushdown_applied = false;
 	vector<ColumnIndex> column_ids;
 	vector<idx_t> projection_ids;
 	atomic<bool> ack_sent {false};
@@ -214,14 +220,41 @@ private:
 	vector<ChunkResult> results;
 };
 
+//! All WHERE conjuncts for the rewritten remote query: filters captured at optimize time plus
+//! the table filters the planner pushed into this scan.
+static string BuildWhereClause(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
+	vector<string> clauses = bind_data.remote_filters;
+	if (input.filters && input.filters->HasFilters()) {
+		auto filter_clause = BuildFilterWhereClause(*input.filters, input.column_indexes, bind_data.column_names,
+		                                            bind_data.column_types);
+		if (!filter_clause.empty()) {
+			clauses.push_back(std::move(filter_clause));
+		}
+	}
+	return StringUtil::Join(clauses, " AND ");
+}
+
+//! The columns the scan must output: with filter_prune, projection_ids selects the output subset
+//! of column_indexes and filter-only columns stay out of the SELECT list, since they are
+//! evaluated in the WHERE instead.
+static vector<ColumnIndex> OutputColumns(const TableFunctionInitInput &input) {
+	if (!input.CanRemoveFilterColumns()) {
+		return input.column_indexes;
+	}
+	vector<ColumnIndex> result;
+	for (auto &proj_id : input.projection_ids) {
+		result.push_back(input.column_indexes[proj_id]);
+	}
+	return result;
+}
+
 static string BuildPushdownQuery(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
 	string query;
 
 	// Projection: select only the columns DuckDB actually needs in the output.
-	// With filter_prune, projection_ids indexes into column_ids for output columns only.
-	// Filter-only columns are in column_ids but NOT in projection_ids — they go in WHERE, not SELECT.
-	if (!input.column_indexes.empty()) {
-		for (auto &col_id : input.column_indexes) {
+	auto output_columns = OutputColumns(input);
+	if (!output_columns.empty()) {
+		for (auto &col_id : output_columns) {
 			if (!query.empty()) {
 				query += ", ";
 			}
@@ -238,116 +271,129 @@ static string BuildPushdownQuery(const QuackScanBindData &bind_data, const Table
 		}
 		query = "SELECT " + query + " ";
 	}
-	// 	vector<string> selected_columns;
-	// 	if (!input.projection_ids.empty()) {
-	// 		for (auto &proj_id : input.projection_ids) {
-	// 			auto col_id = input.column_ids[proj_id];
-	// 			if (IsRowIdColumnId(col_id) || col_id >= bind_data.column_names.size()) {
-	// 				continue;
-	// 			}
-	// 			selected_columns.push_back(KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_id]));
-	// 		}
-	// 	} else {
-	// 		for (auto &col_id : input.column_ids) {
-	// 			if (IsRowIdColumnId(col_id) || col_id >= bind_data.column_names.size()) {
-	// 				continue;
-	// 			}
-	// 			selected_columns.push_back(KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_id]));
-	// 		}
-	// 	}
-	// 	if (!selected_columns.empty()) {
-	// 		query = "SELECT " + StringUtil::Join(selected_columns, ", ") + " ";
-	// 	}
-	// }
 	query += StringUtil::Format("FROM %s", SQLIdentifier(bind_data.table_name));
-	//
-	// // Filters: build WHERE clause from pushable filters
-	// if (input.filters) {
-	// 	vector<string> where_clauses;
-	// 	for (auto &entry : input.filters->filters) {
-	// 		auto col_idx = entry.second.GetIndex();
-	// 		if (col_idx >= bind_data.column_names.size()) {
-	// 			continue;
-	// 		}
-	// 		auto &filter = entry.Filter();
-	// 		if (!CanPushdownFilter(filter)) {
-	// 			continue;
-	// 		}
-	// 		auto col_name = KeywordHelper::WriteOptionallyQuoted(bind_data.column_names[col_idx]);
-	// 		where_clauses.push_back(filter.ToString(col_name));
-	// 	}
-	// 	if (!where_clauses.empty()) {
-	// 		query += " WHERE " + StringUtil::Join(where_clauses, " AND ");
-	// 	}
-	// }
+	auto where_clause = BuildWhereClause(bind_data, input);
+	if (!where_clause.empty()) {
+		query += " WHERE " + where_clause;
+	}
 
+	return query;
+}
+
+//! Rebuild the remote SQL for a by-name scan with projection/filters applied server-side.
+//! Returns an empty string when the bind-time result can stream as-is: no filters to enforce and
+//! either the full width is needed or the data already arrived in the bind-time batch.
+static string BuildByNamePushdownQuery(const QuackScanBindData &bind_data, const TableFunctionInitInput &input) {
+	auto where_clause = BuildWhereClause(bind_data, input);
+	auto output_columns = OutputColumns(input);
+	bool narrowing = output_columns.size() < bind_data.column_types.size();
+	for (auto &col_id : output_columns) {
+		if (col_id.IsVirtualColumn()) {
+			narrowing = true;
+		}
+	}
+	// projection alone only saves wire time if the server still holds undelivered batches
+	if (where_clause.empty() && !(narrowing && bind_data.needs_more_fetch)) {
+		return string();
+	}
+	vector<string> select_list;
+	for (auto &col_id : output_columns) {
+		if (col_id.IsVirtualColumn()) {
+			auto virtual_column = col_id.GetPrimaryIndex();
+			if (virtual_column == COLUMN_IDENTIFIER_EMPTY || virtual_column == COLUMN_IDENTIFIER_ROW_ID) {
+				select_list.push_back("NULL::BIGINT");
+			} else {
+				throw InternalException("Unsupported virtual column index");
+			}
+		} else {
+			select_list.push_back(SQLIdentifier::ToString(bind_data.column_names[col_id.GetPrimaryIndex()]));
+		}
+	}
+	auto query = "SELECT " + (select_list.empty() ? string("*") : StringUtil::Join(select_list, ", ")) +
+	             StringUtil::Format(" FROM (%s)", bind_data.remote_query);
+	if (!where_clause.empty()) {
+		query += " WHERE " + where_clause;
+	}
 	return query;
 }
 
 unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<QuackScanBindData>();
 
-	// For the catalog path (ATTACH), LookupEntry only prepares without executing
-	// to avoid the server-side result being overwritten by subsequent lookups.
-	// We execute the query here, right before scanning, so the result is fresh.
 	vector<ChunkResult> results;
 	bool needs_more_fetch = bind_data.needs_more_fetch;
+	bool pushdown_applied = true;
 	hugeint_t query_uuid;
+	string query;
+	bool raw_replay = false;
 	if (!bind_data.table_name.empty()) {
-		// apply pushdown to the query
-		auto query = BuildPushdownQuery(bind_data, input);
+		query = BuildPushdownQuery(bind_data, input);
+	} else {
+		query = BuildByNamePushdownQuery(bind_data, input);
+		if (query.empty() && !bind_data.has_unconsumed_bind_result) {
+			// The bind-time result was already consumed (a re-executed prepared statement) or
+			// never existed (a schema-only bind): run the original query again.
+			query = bind_data.remote_query;
+			raw_replay = true;
+		}
+	}
+	if (!query.empty()) {
+		auto &mutable_bind_data = input.bind_data->CastNoConst<QuackScanBindData>();
+		if (bind_data.table_name.empty() && bind_data.has_unconsumed_bind_result && bind_data.needs_more_fetch) {
+			// The bind-time result streams the raw relation; drop it in favour of the rewrite
+			// rather than leaving it pending on the connection.
+			bind_data.client_connection->CloseResult(bind_data.query_uuid);
+			mutable_bind_data.has_unconsumed_bind_result = false;
+		}
 		auto &client_connection = *bind_data.client_connection;
 		auto client_wrapper = client_connection.GetClient(context);
 		auto &client = client_wrapper->GetClient();
 		query_uuid = UUID::GenerateRandomUUID();
 		auto response_message = client.Request<PrepareResponseMessage>(
 		    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, query_uuid));
-		needs_more_fetch = response_message->NeedsMoreFetch();
-		// fetch the result
-		for (auto &chunk_ref : response_message->MutableResults()) {
-			auto &chunk = chunk_ref->Chunk();
-			results.emplace_back(chunk, ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED);
+		// The scan consumes chunks positionally, so a server-side schema drift must fail loudly
+		// instead of mapping the wrong columns.
+		vector<LogicalType> expected_types;
+		if (raw_replay) {
+			expected_types = bind_data.column_types;
+		} else {
+			for (auto &col_id : OutputColumns(input)) {
+				expected_types.push_back(col_id.IsVirtualColumn() ? LogicalType::BIGINT
+				                                                  : bind_data.column_types[col_id.GetPrimaryIndex()]);
+			}
 		}
-	} else if (bind_data.has_unconsumed_bind_result) {
-		// The bind executed the query and its chunks are still unread: stream them.
-		for (auto &chunk_ref : bind_data.results) {
-			auto &chunk = chunk_ref->Chunk();
-			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
-		}
-		query_uuid = bind_data.query_uuid;
-		// A re-execution of this plan must not replay chunks that have been handed out already.
-		input.bind_data->CastNoConst<QuackScanBindData>().has_unconsumed_bind_result = false;
-	} else {
-		// Either the bind was schema-only, or its result was already consumed by an earlier
-		// execution of this plan: run the query now.
-		auto &client_connection = *bind_data.client_connection;
-		auto client_wrapper = client_connection.GetClient(context);
-		auto &client = client_wrapper->GetClient();
-		query_uuid = UUID::GenerateRandomUUID();
-		auto response_message = client.Request<PrepareResponseMessage>(
-		    context,
-		    make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), bind_data.remote_query, query_uuid));
-		// Chunks are consumed positionally, so a server-side schema change must fail loudly
-		// instead of mapping the wrong columns onto the scan's types.
-		if (response_message->Types() != bind_data.column_types) {
+		if (response_message->Types() != expected_types) {
 			auto type_list = [](const vector<LogicalType> &types) {
 				return StringUtil::Join(types, types.size(), ", ",
 				                        [](const LogicalType &type) { return type.ToString(); });
 			};
 			throw InvalidInputException("quack scan: the server returned a result shaped (%s) for \"%s\", expected (%s)",
-			                            type_list(response_message->Types()), bind_data.remote_query,
-			                            type_list(bind_data.column_types));
+			                            type_list(response_message->Types()), query, type_list(expected_types));
 		}
+		pushdown_applied = !raw_replay;
 		needs_more_fetch = response_message->NeedsMoreFetch();
+		auto chunk_pushdown_type =
+		    raw_replay ? ChunkResultPushdownType::REQUIRES_PUSHDOWN : ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
 		for (auto &chunk_ref : response_message->MutableResults()) {
+			auto &chunk = chunk_ref->Chunk();
+			results.emplace_back(chunk, chunk_pushdown_type);
+		}
+	} else {
+		pushdown_applied = false;
+		for (auto &chunk_ref : bind_data.results) {
 			auto &chunk = chunk_ref->Chunk();
 			results.emplace_back(chunk, ChunkResultPushdownType::REQUIRES_PUSHDOWN);
 		}
+		query_uuid = bind_data.query_uuid;
+		// The scan takes over the bind-time result; a later execution of this bind data must
+		// re-issue the query rather than replay chunks that have been handed out.
+		input.bind_data->CastNoConst<QuackScanBindData>().has_unconsumed_bind_result = false;
 	}
 	// we only multithread if there is more to fetch
 	auto global_state = make_uniq<QuackScanGlobalState>(input.column_indexes, input.projection_ids, std::move(results),
 	                                                    needs_more_fetch, query_uuid);
 	global_state->client_connection = bind_data.client_connection;
+	global_state->pushdown_applied = pushdown_applied;
 	if (needs_more_fetch) {
 		// start pipelining FETCH requests on the ASYNC pool before the first scan call
 		global_state->fetcher = make_shared_ptr<QuackFetcher>(context, *bind_data.client_connection, query_uuid,
@@ -436,11 +482,12 @@ static void QuackScan(ClientContext &context, TableFunctionInput &input, DataChu
 			vector<unique_ptr<DataChunk>> chunks;
 			switch (global_state.fetcher->GetBatch(context, input, local_state.fetch_claim, batch_index, chunks)) {
 			case QuackFetchResult::BATCH: {
-				// tag fetched chunks like the initial batch (see QuackScanInitGlobal): direct queries
-				// return full-width chunks that still need projection, the catalog path already projected
-				auto fetched_pushdown_type = bind_data.table_name.empty()
-				                                 ? ChunkResultPushdownType::REQUIRES_PUSHDOWN
-				                                 : ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED;
+				// Tag fetched chunks like the initial batch (see QuackScanInitGlobal): a result the
+				// server projected arrives final, one streaming the raw relation still needs the
+				// client-side projection.
+				auto fetched_pushdown_type = global_state.pushdown_applied
+				                                 ? ChunkResultPushdownType::PUSHDOWN_ALREADY_APPLIED
+				                                 : ChunkResultPushdownType::REQUIRES_PUSHDOWN;
 				for (auto &chunk : chunks) {
 					local_state.results.emplace(*chunk, fetched_pushdown_type);
 				}
@@ -499,6 +546,26 @@ BindInfo QuackScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
 	return BindInfo(ScanType::EXTERNAL);
 }
 
+static unique_ptr<NodeStatistics> QuackScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	if (!bind_data_p) {
+		return nullptr;
+	}
+	auto &bind_data = bind_data_p->Cast<QuackScanBindData>();
+	if (bind_data.estimated_cardinality > 0) {
+		return make_uniq<NodeStatistics>(bind_data.estimated_cardinality);
+	}
+	// No server estimate (an eager bind, or an older server): assume the configured cardinality
+	// so the optimizer does not size the remote relation at the 1-row default.
+	Value assumed;
+	if (context.TryGetCurrentSetting("quack_assumed_scan_cardinality", assumed)) {
+		auto value = assumed.GetValue<uint64_t>();
+		if (value > 0) {
+			return make_uniq<NodeStatistics>(value);
+		}
+	}
+	return nullptr;
+}
+
 TableFunction QuackScanFunction::GetFunction() {
 	auto fun = TableFunction("quack_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, QuackScan, QuackScanBind,
 	                         QuackScanInitGlobal, QuackScanInitLocal);
@@ -513,8 +580,9 @@ TableFunction QuackScanFunction::GetFunction() {
 	fun.serialize = QuackScanSerialize;
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
-	// fun.filter_pushdown = true;
-	// fun.filter_prune = true;
+	fun.cardinality = QuackScanCardinality;
+	fun.filter_pushdown = true;
+	fun.filter_prune = true;
 	return fun;
 }
 
@@ -527,10 +595,11 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.serialize = QuackScanSerialize;
 	fun.deserialize = QuackScanDeserialize;
 	fun.get_bind_info = QuackScanGetBindInfo;
+	fun.cardinality = QuackScanCardinality;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
 	fun.named_parameters["eager"] = LogicalType::BOOLEAN;
-	// fun.filter_pushdown = true;
-	// fun.filter_prune = true;
+	fun.filter_pushdown = true;
+	fun.filter_prune = true;
 	return fun;
 }
 

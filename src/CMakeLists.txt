@@ -8,6 +8,7 @@ add_library(
   quack_data_stream.cpp
   quack_extension.cpp
   quack_fetch_ahead.cpp
+  quack_filter_sql.cpp
   quack_http_server.cpp
   quack_log.cpp
   quack_message.cpp
