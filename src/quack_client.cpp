@@ -193,10 +193,11 @@ unique_ptr<QuackClient> QuackClient::GetClient(ClientContext &context, const Qua
 }
 
 QuackClientConnection::QuackClientConnection(DatabaseInstance &db_p, unique_ptr<QuackClient> client_p, QuackUri uri_p,
-                                             string connection_id_p, idx_t heartbeat_timeout_seconds_p,
-                                             idx_t max_connections_cached_p)
+                                             string connection_id_p, idx_t heartbeat_timeout_seconds_p, string token_p,
+                                             string client_id_p, idx_t max_connections_cached_p)
     : db(db_p), uri(std::move(uri_p)), connection_id(std::move(connection_id_p)),
-      heartbeat_timeout_seconds(heartbeat_timeout_seconds_p), max_connections_cached(max_connections_cached_p) {
+      heartbeat_timeout_seconds(heartbeat_timeout_seconds_p), token(std::move(token_p)),
+      client_id(std::move(client_id_p)), max_connections_cached(max_connections_cached_p) {
 	if (client_p) {
 		StoreClient(std::move(client_p));
 	}
@@ -225,7 +226,7 @@ void QuackClientConnection::StartHeartbeat() {
 //! A failed attempt is not terminal: the worker swallows the throw and retries next interval.
 void QuackClientConnection::SendHeartbeat() {
 	auto client = TakeClient(nullptr);
-	client->Request<SuccessResponse>(nullptr, make_uniq<HeartbeatRequestMessage>(connection_id));
+	client->Request<SuccessResponse>(nullptr, make_uniq<HeartbeatRequestMessage>(ConnectionId()));
 	StoreClient(std::move(client));
 }
 
@@ -314,8 +315,12 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	// Cache at most one client per async send slot: pending SEND_DATA tasks can check out far more
 	// clients than ever POST concurrently, and each cached client pins a server connection slot.
 	idx_t pool_size = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfAsyncThreads());
-	auto connection = make_shared_ptr<QuackClientConnection>(
-	    *context.db, std::move(client), uri, std::move(connection_id), accepted_heartbeat_timeout_seconds, pool_size);
+	// Token and client_id are retained so the session can be re-established when the server
+	// forgets it (a restart), rather than the connection staying poisoned for its lifetime.
+	auto connection = make_shared_ptr<QuackClientConnection>(*context.db, std::move(client), uri,
+	                                                         std::move(connection_id),
+	                                                         accepted_heartbeat_timeout_seconds, std::move(token),
+	                                                         std::move(client_id), pool_size);
 	connection->StartHeartbeat();
 	return connection;
 }
@@ -355,6 +360,39 @@ void QuackClient::NoteError(const ErrorResponse &error_response) {
 
 void QuackClientConnection::MarkServerInvalidated() const {
 	server_invalidated = true;
+}
+
+bool QuackClientConnection::Reconnect(ClientContext &context, const string &stale_connection_id) const {
+	// One re-handshake at a time: the first failing request reconnects, concurrent ones then
+	// observe the refreshed id and simply retry against it.
+	lock_guard<mutex> reconnect_guard(reconnect_lock);
+	{
+		lock_guard<mutex> guard(lock);
+		if (connection_id != stale_connection_id) {
+			return true;
+		}
+	}
+	if (token.empty()) {
+		// no retained credential to re-handshake with
+		return false;
+	}
+	if (server_invalidated) {
+		// The server's database is gone: it cannot run its authentication query either, so a fresh
+		// handshake would be answered with a misleading "Authentication failed". The original error
+		// already says what happened.
+		return false;
+	}
+	try {
+		auto client = QuackClient::GetClient(context, uri);
+		auto response = client->Request<ConnectionResponseMessage>(
+		    context, make_uniq<ConnectionRequestMessage>(token, client_id, heartbeat_timeout_seconds));
+		lock_guard<mutex> guard(lock);
+		connection_id = response->ConnectionId();
+		return true;
+	} catch (...) {
+		// the server is unreachable or rejected the handshake - surface the original error
+		return false;
+	}
 }
 
 void QuackClientConnection::AcknowledgeResult(hugeint_t query_uuid) const noexcept {

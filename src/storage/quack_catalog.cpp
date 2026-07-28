@@ -72,8 +72,14 @@ void QuackCatalog::EnsureLoaded(ClientContext &context) {
 
 QuackLoadCatalogData QuackCatalog::LoadCatalogWith(ClientContext &context, QuackClientConnection &connection) {
 	QuackLoadCatalogData result;
-	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery());
-	result.tables = ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery());
+	// A catalog load reads nothing the session already holds, so it can re-handshake if the server
+	// forgot us - the state a pooled connection is in after a server roll.
+	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery(), /*allow_reconnect=*/true);
+	Value views_only_val;
+	auto views_only = context.TryGetCurrentSetting("quack_catalog_views_only", views_only_val) &&
+	                  !views_only_val.IsNull() && BooleanValue::Get(views_only_val);
+	result.tables =
+	    ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery(views_only), /*allow_reconnect=*/true);
 	return result;
 }
 
@@ -139,20 +145,28 @@ optional_ptr<SchemaCatalogEntry> QuackCatalog::LookupSchema(CatalogTransaction t
 	return entry->Cast<SchemaCatalogEntry>();
 }
 
-unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query,
+                                                                      bool allow_reconnect) {
 	EnsureLoaded(context);
-	return ExecuteCommandOn(context, *client_connection, query);
+	return ExecuteCommandOn(context, *client_connection, query, allow_reconnect);
 }
 
 unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &context,
-                                                                QuackClientConnection &connection,
-                                                                const string &query) {
+                                                                QuackClientConnection &connection, const string &query,
+                                                                bool allow_reconnect) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	auto client_wrapper = connection.GetClient(context);
-	auto &client = client_wrapper->GetClient();
-	auto response = client.Request<PrepareResponseMessage>(
-	    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
+	unique_ptr<PrepareResponseMessage> response;
+	if (allow_reconnect) {
+		response = connection.RequestWithReconnect<PrepareResponseMessage>(
+		    context, [&](const string &connection_id) {
+			    return make_uniq<PrepareRequestMessage>(connection_id, query, 0);
+		    });
+	} else {
+		auto client_wrapper = connection.GetClient(context);
+		response = client_wrapper->GetClient().Request<PrepareResponseMessage>(
+		    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
+	}
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
@@ -161,6 +175,9 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &c
 	// dropping tables and views: harmless while the load ran during ATTACH with default
 	// settings, but it loads on first use now, under whatever batch size is in effect then.
 	auto query_uuid = response->QueryUUID();
+	// Fetches must not re-handshake: they depend on the result the current session is holding.
+	auto client_wrapper = connection.GetClient(context);
+	auto &client = client_wrapper->GetClient();
 	for (idx_t batch_index = 1; response->NeedsMoreFetch(); batch_index++) {
 		// Batches are claimed by dense index; every batch below this one has arrived, so ack them.
 		auto fetch_response = client.Request<FetchResponseMessage>(
@@ -200,12 +217,12 @@ void QuackCatalog::Refresh(ClientContext &context) {
 	schemas->Reload(context, *this, load_info);
 }
 
-const string &QuackCatalog::GetConnectionId(ClientContext &context) {
+string QuackCatalog::GetConnectionId(ClientContext &context) {
 	EnsureLoaded(context);
 	return client_connection->ConnectionId();
 }
 
-const string &QuackCatalog::GetConnectionId() {
+string QuackCatalog::GetConnectionId() {
 	if (!client_connection) {
 		throw InternalException("Quack catalog was used before it was loaded");
 	}

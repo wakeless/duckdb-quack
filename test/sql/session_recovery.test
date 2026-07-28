@@ -1,0 +1,66 @@
+# name: test/sql/session_recovery.test
+# description: a client session survives the server forgetting it, by re-handshaking
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t1 as select range i from range(100);
+
+statement ok quack_db:quack_server_con
+create view v1 as from t1;
+
+statement ok con2
+create secret (type quack, token 'asdf')
+
+statement ok con2
+attach {server} as remote
+
+query I con2
+select count(*) from remote.main.v1;
+----
+100
+
+# Restart the server: a fresh instance has an empty session table, so the client's cached
+# connection id is no longer known to it.
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement ok con2
+call enable_logging('Quack');
+
+# the same attached catalog keeps working: the scan re-handshakes with the retained token
+# and resends against the fresh session
+query I con2
+select count(*) from remote.main.v1;
+----
+100
+
+# the recovery really was a re-handshake, not a lucky reuse
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# and the healed session keeps serving
+query II con2
+select count(*), sum(i) from remote.main.v1;
+----
+100	4950
+
+# a second engine connection shares the healed session
+query I con1
+select count(*) from remote.main.v1;
+----
+100
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template

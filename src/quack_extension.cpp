@@ -230,6 +230,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "executor blocks when the client falls this far behind",
 	                          LogicalType::UBIGINT, Value::UBIGINT(QUACK_FETCH_PRODUCER_BUFFER_BYTES_DEFAULT));
 
+	config.AddExtensionOption("quack_catalog_views_only",
+	                          "Enumerate only views when snapshotting an attached quack catalog, for servers "
+	                          "that expose curated views over tables sharing their schema name",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	config.AddExtensionOption("quack_join_pushdown",
 	                          "Allow joins between two scans of one server to execute on that server",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));

@@ -69,7 +69,7 @@ unique_ptr<ColumnDataCollection> QuackTransaction::Query(const string &query) {
 		// context has been destroyed - silently ignore the query
 		return nullptr;
 	}
-	return quack_catalog.ExecuteCommandInternal(*context_ref, query);
+	return quack_catalog.ExecuteCommandInternal(*context_ref, query, /*allow_reconnect=*/true);
 }
 
 } // namespace duckdb
