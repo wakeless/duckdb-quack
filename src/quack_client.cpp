@@ -164,9 +164,9 @@ unique_ptr<QuackClient> QuackClient::GetClient(ClientContext &context, const Qua
 }
 
 QuackClientConnection::QuackClientConnection(unique_ptr<QuackClient> client_p, QuackUri uri_p, string connection_id_p,
-                                             idx_t max_connections_cached_p)
-    : uri(std::move(uri_p)), connection_id(std::move(connection_id_p)),
-      max_connections_cached(max_connections_cached_p) {
+                                             string token_p, string client_id_p, idx_t max_connections_cached_p)
+    : uri(std::move(uri_p)), connection_id(std::move(connection_id_p)), token(std::move(token_p)),
+      client_id(std::move(client_id_p)), max_connections_cached(max_connections_cached_p) {
 	if (client_p) {
 		StoreClient(std::move(client_p));
 	}
@@ -241,7 +241,10 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
 	// Cache at most one client per async send slot: pending SEND_DATA tasks can check out far more
 	// clients than ever POST concurrently, and each cached client pins a server connection slot.
 	idx_t pool_size = MaxValue<idx_t>(1, (idx_t)TaskScheduler::GetScheduler(context).NumberOfAsyncThreads());
-	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id), pool_size);
+	// Token and client_id are retained so the session can be re-established when the server
+	// forgets it (a restart), rather than the connection staying poisoned for its lifetime.
+	return make_shared_ptr<QuackClientConnection>(std::move(client), uri, std::move(connection_id), std::move(token),
+	                                              std::move(client_id), pool_size);
 }
 
 unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &context) const {
@@ -258,6 +261,33 @@ unique_ptr<QuackClientWrapper> QuackClientConnection::GetClient(ClientContext &c
 	// Stamp the checking-out query's logger so this client's POSTs (incl. off-thread async sends) are logged.
 	result->SetRequestLogger(context.logger);
 	return make_uniq<QuackClientWrapper>(std::move(result), shared_from_this());
+}
+
+bool QuackClientConnection::Reconnect(ClientContext &context, const string &stale_connection_id) const {
+	// One re-handshake at a time: the first failing request reconnects, concurrent ones then
+	// observe the refreshed id and simply retry against it.
+	lock_guard<mutex> reconnect_guard(reconnect_lock);
+	{
+		lock_guard<mutex> guard(lock);
+		if (connection_id != stale_connection_id) {
+			return true;
+		}
+	}
+	if (token.empty()) {
+		// no retained credential to re-handshake with
+		return false;
+	}
+	try {
+		auto client = QuackClient::GetClient(context, uri);
+		auto response =
+		    client->Request<ConnectionResponseMessage>(context, make_uniq<ConnectionRequestMessage>(token, client_id));
+		lock_guard<mutex> guard(lock);
+		connection_id = response->ConnectionId();
+		return true;
+	} catch (...) {
+		// the server is unreachable or rejected the handshake - surface the original error
+		return false;
+	}
 }
 
 void QuackClientConnection::CloseResult(hugeint_t query_uuid) const noexcept {

@@ -348,11 +348,12 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 			mutable_bind_data.has_unconsumed_bind_result = false;
 		}
 		auto &client_connection = *bind_data.client_connection;
-		auto client_wrapper = client_connection.GetClient(context);
-		auto &client = client_wrapper->GetClient();
 		query_uuid = UUID::GenerateRandomUUID();
-		auto response_message = client.Request<PrepareResponseMessage>(
-		    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, query_uuid));
+		// A fresh PREPARE depends on no server-side state, so it can re-handshake and resend.
+		auto response_message = client_connection.RequestWithReconnect<PrepareResponseMessage>(
+		    context, [&](const string &connection_id) {
+			    return make_uniq<PrepareRequestMessage>(connection_id, query, query_uuid);
+		    });
 		// The scan consumes chunks positionally, so a server-side schema drift must fail loudly
 		// instead of mapping the wrong columns.
 		vector<LogicalType> expected_types;

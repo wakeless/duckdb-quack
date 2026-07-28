@@ -69,7 +69,10 @@ void QuackCatalog::EnsureLoaded(ClientContext &context) {
 QuackLoadCatalogData QuackCatalog::LoadCatalogWith(ClientContext &context, QuackClientConnection &connection) {
 	QuackLoadCatalogData result;
 	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery());
-	result.tables = ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery());
+	Value views_only_val;
+	auto views_only = context.TryGetCurrentSetting("quack_catalog_views_only", views_only_val) &&
+	                  !views_only_val.IsNull() && BooleanValue::Get(views_only_val);
+	result.tables = ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery(views_only));
 	return result;
 }
 
@@ -115,10 +118,11 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &c
                                                                 const string &query) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	auto client_wrapper = connection.GetClient(context);
-	auto &client = client_wrapper->GetClient();
-	auto response = client.Request<PrepareResponseMessage>(
-	    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
+	// A catalog load starts a session's work, so it can re-handshake if the server forgot us.
+	auto response = connection.RequestWithReconnect<PrepareResponseMessage>(
+	    context, [&](const string &connection_id) {
+		    return make_uniq<PrepareRequestMessage>(connection_id, query, 0);
+	    });
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
@@ -127,6 +131,9 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &c
 	// dropping tables and views: harmless while the load ran during ATTACH with default
 	// settings, but it loads on first use now, under whatever batch size is in effect then.
 	auto query_uuid = response->QueryUUID();
+	// Fetches must not re-handshake: they depend on the result the current session is holding.
+	auto client_wrapper = connection.GetClient(context);
+	auto &client = client_wrapper->GetClient();
 	while (response->NeedsMoreFetch()) {
 		auto fetch_response = client.Request<FetchResponseMessage>(
 		    context, make_uniq<FetchRequestMessage>(connection.ConnectionId(), query_uuid));

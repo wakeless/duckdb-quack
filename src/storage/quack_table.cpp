@@ -66,7 +66,17 @@ QuackTableSet::QuackTableSet(QuackSchemaCatalogEntry &parent)
     : QuackCatalogSet(parent.ParentCatalog().Cast<QuackCatalog>()), schema(parent) {
 }
 
-string QuackTableSet::GetLoadQuery() {
+string QuackTableSet::GetLoadQuery(bool views_only) {
+	// A server that exposes its data as curated views over an ATTACHed catalog wants views only:
+	// the raw tables behind those views share the schema name, and enumerating them binds their
+	// placeholder schema and collides with the views. Views bind opaquely and still push down
+	// filtered and aggregated queries.
+	if (views_only) {
+		return R"(
+SELECT schema_name, view_name, 'view'
+FROM duckdb_views()
+	)";
+	}
 	return R"(
 SELECT schema_name, sql, 'table'
 FROM duckdb_tables()

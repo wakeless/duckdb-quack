@@ -190,6 +190,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Rows a thread buffers before flushing one SEND_DATA_REQUEST (0 = default 204800)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
 
+	config.AddExtensionOption("quack_catalog_views_only",
+	                          "Enumerate only views when snapshotting an attached quack catalog, for servers "
+	                          "that expose curated views over tables sharing their schema name",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+
 	config.AddExtensionOption("quack_join_pushdown",
 	                          "Allow joins between two scans of one server to execute on that server",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
