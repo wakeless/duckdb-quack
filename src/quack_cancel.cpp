@@ -23,7 +23,7 @@ struct QuackCancelBindData : FunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<QuackCancelBindData>(target_connection_id, cancelled);
 		result->finished = finished;
-		return result;
+		return std::move(result);
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		return target_connection_id == other_p.Cast<QuackCancelBindData>().target_connection_id;

@@ -30,7 +30,7 @@ struct QuackActiveConnectionsData : FunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<QuackActiveConnectionsData>();
 		result->finished = finished;
-		return result;
+		return std::move(result);
 	}
 	bool Equals(const FunctionData &) const override {
 		return false;
