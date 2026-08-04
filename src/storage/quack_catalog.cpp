@@ -264,7 +264,7 @@ unique_ptr<TableRef> QuackCatalog::RemoteExecute(ClientContext &context, const s
 	args.push_back(std::move(use_transaction));
 	auto func_ref = make_uniq<TableFunctionRef>();
 	func_ref->function = make_uniq<FunctionExpression>("quack_query_by_name", std::move(args));
-	return func_ref;
+	return std::move(func_ref);
 }
 
 bool QuackCatalog::InMemory() {
