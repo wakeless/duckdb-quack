@@ -121,7 +121,7 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	                                              /*prepare_only=*/!eager));
 	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 
-	return bind_data;
+	return std::move(bind_data);
 }
 
 static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context, TableFunctionBindInput &input,
@@ -172,7 +172,7 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 		// statement is always bound on its own, so no catalog entry is in use here
 		catalog.Refresh(context);
 	}
-	return bind_data;
+	return std::move(bind_data);
 }
 
 enum class ChunkResultPushdownType { REQUIRES_PUSHDOWN, PUSHDOWN_ALREADY_APPLIED };
@@ -469,7 +469,7 @@ unique_ptr<LocalTableFunctionState> QuackScanInitLocal(ExecutionContext &context
 	for (auto &chunk : results) {
 		local_state->results.push(std::move(chunk));
 	}
-	return local_state;
+	return std::move(local_state);
 }
 
 static void SendAcknowledgement(ClientContext &context, QuackScanGlobalState &global_state,
