@@ -88,14 +88,14 @@ static unique_ptr<FunctionData> QuackScanBind(ClientContext &context, TableFunct
 	bind_data->client_connection = QuackClient::ConnectToServer(context, server_uri, token, std::move(client_id));
 	auto &client_connection = *bind_data->client_connection;
 
-	auto client_wrapper = client_connection.GetClient(context);
-	auto &client = client_wrapper->GetClient();
-
 	auto eager = IsEagerBind(input);
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
-	auto bind_response = client.Request<PrepareResponseMessage>(
-	    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, bind_data->query_uuid,
-	                                              /*prepare_only=*/!eager));
+	// A bind-time PREPARE depends on no server-side state, so it can re-handshake and resend.
+	auto bind_response = client_connection.RequestWithReconnect<PrepareResponseMessage>(
+	    context, [&](const string &connection_id) {
+		    return make_uniq<PrepareRequestMessage>(connection_id, query, bind_data->query_uuid,
+		                                            /*prepare_only=*/!eager);
+	    });
 	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 
 	return std::move(bind_data);
@@ -126,13 +126,16 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	auto query = input.inputs[1].GetValue<string>();
 	auto bind_data = make_uniq<QuackScanBindData>();
 	bind_data->client_connection = catalog.GetClientConnection(context);
-	auto client_wrapper = bind_data->client_connection->GetClient(context);
-	auto &client = client_wrapper->GetClient();
 	auto eager = IsEagerBind(input);
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
-	auto bind_response = client.Request<PrepareResponseMessage>(
-	    context, make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query,
-	                                              bind_data->query_uuid, /*prepare_only=*/!eager));
+	// A warm catalog holds a session the server may have forgotten (a restart), and the bind is then
+	// the first request on it: re-handshake and resend rather than failing the query. A bind-time
+	// PREPARE depends on no server-side state, so replaying it is safe.
+	auto bind_response = bind_data->client_connection->RequestWithReconnect<PrepareResponseMessage>(
+	    context, [&](const string &connection_id) {
+		    return make_uniq<PrepareRequestMessage>(connection_id, query, bind_data->query_uuid,
+		                                            /*prepare_only=*/!eager);
+	    });
 	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 	return std::move(bind_data);
 }

@@ -412,6 +412,8 @@ SinkFinalizeType QuackInsert::Finalize(Pipeline &pipeline, Event &event, ClientC
 		stream_floor = global_state.stream_floor;
 	}
 	finalize_msg->SetMinBatchWatermark(stream_floor);
+	// FINALIZE must not re-handshake: the appended batches live in the session being finalized, so a
+	// fresh session would commit nothing and report success over lost rows.
 	client.Request<SuccessResponse>(context, std::move(finalize_msg));
 	return SinkFinalizeType::READY;
 }
