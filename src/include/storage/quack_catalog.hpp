@@ -74,7 +74,11 @@ public:
 		return GetDBPath();
 	}
 
-	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query);
+	//! `allow_reconnect` re-handshakes and resends when the server has forgotten the session. Only
+	//! pass true for a request that depends on no server-side state: a statement issued inside an
+	//! open remote transaction would otherwise apply outside it.
+	unique_ptr<ColumnDataCollection> ExecuteCommandInternal(ClientContext &context, const string &query,
+	                                                       bool allow_reconnect);
 	const QuackUri &GetServerUri() {
 		return server_uri;
 	}
@@ -103,7 +107,7 @@ private:
 	//! Run a command against an explicit connection, bypassing EnsureLoaded - used by the load
 	//! itself, which would otherwise recurse.
 	unique_ptr<ColumnDataCollection> ExecuteCommandOn(ClientContext &context, QuackClientConnection &connection,
-	                                                  const string &query);
+	                                                  const string &query, bool allow_reconnect);
 
 private:
 	QuackUri server_uri;

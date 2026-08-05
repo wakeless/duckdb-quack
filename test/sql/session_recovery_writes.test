@@ -1,0 +1,66 @@
+# name: test/sql/session_recovery_writes.test
+# description: a pooled connection's writes survive the server forgetting the session
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t1(i int);
+
+statement ok con2
+create secret (type quack, token 'asdf')
+
+statement ok con2
+attach {server} as remote
+
+# Warm the session and the catalog with a write, so the restart below leaves a pooled connection
+# holding a session id the server no longer knows.
+statement ok con2
+insert into remote.main.t1 values (1);
+
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement ok con2
+call enable_logging('Quack');
+
+# The write's own transaction-opening BEGIN is the first request on the stale session, so it
+# re-handshakes and the INSERT lands on the fresh one.
+statement ok con2
+insert into remote.main.t1 values (2);
+
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+query I quack_db:quack_server_con
+select count(*) from t1;
+----
+2
+
+# DDL and CTAS recover the same way
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement ok con2
+create table remote.main.t2 as select 42 as i;
+
+query I quack_db:quack_server_con
+select count(*) from t2;
+----
+1
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template

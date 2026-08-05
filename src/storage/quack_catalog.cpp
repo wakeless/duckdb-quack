@@ -68,11 +68,14 @@ void QuackCatalog::EnsureLoaded(ClientContext &context) {
 
 QuackLoadCatalogData QuackCatalog::LoadCatalogWith(ClientContext &context, QuackClientConnection &connection) {
 	QuackLoadCatalogData result;
-	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery());
+	// A catalog load reads nothing the session already holds, so it can re-handshake if the server
+	// forgot us - the state a pooled connection is in after a server roll.
+	result.schemas = ExecuteCommandOn(context, connection, QuackSchemaSet::GetLoadQuery(), /*allow_reconnect=*/true);
 	Value views_only_val;
 	auto views_only = context.TryGetCurrentSetting("quack_catalog_views_only", views_only_val) &&
 	                  !views_only_val.IsNull() && BooleanValue::Get(views_only_val);
-	result.tables = ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery(views_only));
+	result.tables =
+	    ExecuteCommandOn(context, connection, QuackTableSet::GetLoadQuery(views_only), /*allow_reconnect=*/true);
 	return result;
 }
 
@@ -108,21 +111,28 @@ optional_ptr<SchemaCatalogEntry> QuackCatalog::LookupSchema(CatalogTransaction t
 	}
 }
 
-unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query) {
+unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientContext &context, const string &query,
+                                                                      bool allow_reconnect) {
 	EnsureLoaded(context);
-	return ExecuteCommandOn(context, *client_connection, query);
+	return ExecuteCommandOn(context, *client_connection, query, allow_reconnect);
 }
 
 unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandOn(ClientContext &context,
-                                                                QuackClientConnection &connection,
-                                                                const string &query) {
+                                                                QuackClientConnection &connection, const string &query,
+                                                                bool allow_reconnect) {
 	auto chunk_collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator());
 	// get a client to query
-	// A catalog load starts a session's work, so it can re-handshake if the server forgot us.
-	auto response = connection.RequestWithReconnect<PrepareResponseMessage>(
-	    context, [&](const string &connection_id) {
-		    return make_uniq<PrepareRequestMessage>(connection_id, query, 0);
-	    });
+	unique_ptr<PrepareResponseMessage> response;
+	if (allow_reconnect) {
+		response = connection.RequestWithReconnect<PrepareResponseMessage>(
+		    context, [&](const string &connection_id) {
+			    return make_uniq<PrepareRequestMessage>(connection_id, query, 0);
+		    });
+	} else {
+		auto client_wrapper = connection.GetClient(context);
+		response = client_wrapper->GetClient().Request<PrepareResponseMessage>(
+		    context, make_uniq<PrepareRequestMessage>(connection.ConnectionId(), query, 0));
+	}
 	chunk_collection->Initialize(response->Types());
 	for (auto &chunk : response->MutableResults()) {
 		chunk_collection->Append(chunk->Chunk());
