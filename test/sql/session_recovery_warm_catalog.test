@@ -1,0 +1,83 @@
+# name: test/sql/session_recovery_warm_catalog.test
+# description: a bind-time PREPARE on an already-loaded catalog survives the server forgetting the session
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t1 as select range i from range(100);
+
+statement ok quack_db:quack_server_con
+create view v1 as from t1;
+
+statement ok quack_db:quack_server_con
+create view v2 as select i * 2 as j from t1;
+
+statement ok con2
+create secret (type quack, token 'asdf')
+
+statement ok con2
+attach {server} as remote
+
+# Local union views over a remote leg: the leg binds opaquely as quack_query_by_name, so the
+# statement is not a single-catalog remote execute and no transaction-opening BEGIN runs ahead of
+# the bind. This is the shape of a warehouse that unions per-region servers.
+statement ok con2
+create table local_i(i bigint);
+
+statement ok con2
+insert into local_i values (1000);
+
+statement ok con2
+create view u1 as (from local_i) union all (select i from remote.main.v1);
+
+statement ok con2
+create view u2 as (from local_i) union all (select j as i from remote.main.v2);
+
+# Load the catalog while the session is still valid, so the restart below leaves the client with a
+# warm catalog and a stale session id - the state a pooled connection is in after a server roll.
+query I con2
+select count(*) from u1;
+----
+101
+
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement ok con2
+call enable_logging('Quack');
+
+# A view leg the client has not bound yet: the bind-time PREPARE is the first request to reach the
+# fresh server, with no catalog load or BEGIN ahead of it to re-handshake first.
+query I con2
+select count(*) from u2;
+----
+101
+
+# the recovery really was a re-handshake, not a lucky reuse
+query I con2
+select count(*) > 0 from duckdb_logs_parsed('Quack') where message_type = 'CONNECTION_REQUEST';
+----
+true
+
+statement ok con2
+call disable_logging();
+
+# the healed session serves both the newly bound leg and the one bound before the restart
+query I con2
+select sum(i) from u2;
+----
+10900
+
+query I con2
+select count(*) from u1;
+----
+101
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
