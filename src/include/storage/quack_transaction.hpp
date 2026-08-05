@@ -36,6 +36,11 @@ public:
 	unique_ptr<ColumnDataCollection> Query(const string &query);
 
 private:
+	//! Run `query` on the catalog's session. Only the transaction-opening BEGIN may re-handshake a
+	//! session the server has forgotten; see ForceStart.
+	unique_ptr<ColumnDataCollection> QueryInternal(const string &query, bool allow_reconnect);
+
+private:
 	QuackCatalog &quack_catalog;
 	QuackTransactionState transaction_state;
 };
