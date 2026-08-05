@@ -143,14 +143,25 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	bind_data->client_connection = catalog.GetClientConnection(context);
 	auto eager = IsEagerBind(input);
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
-	// A warm catalog holds a session the server may have forgotten (a restart), and the bind is then
-	// the first request on it: re-handshake and resend rather than failing the query. A bind-time
-	// PREPARE depends on no server-side state, so replaying it is safe.
-	auto bind_response = bind_data->client_connection->RequestWithReconnect<PrepareResponseMessage>(
-	    context, [&](const string &connection_id) {
-		    return make_uniq<PrepareRequestMessage>(connection_id, query, bind_data->query_uuid,
-		                                            /*prepare_only=*/!eager);
-	    });
+	bind_data->use_transaction = use_transaction;
+	unique_ptr<PrepareResponseMessage> bind_response;
+	if (use_transaction) {
+		// The statement belongs to the remote transaction ForceStart opened above. The BEGIN was the
+		// request allowed to re-handshake; this one must run on that session or fail with it.
+		auto client_wrapper = bind_data->client_connection->GetClient(context);
+		bind_response = client_wrapper->GetClient().Request<PrepareResponseMessage>(
+		    context, make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query,
+		                                              bind_data->query_uuid, /*prepare_only=*/!eager));
+	} else {
+		// A warm catalog holds a session the server may have forgotten (a restart), and the bind is then
+		// the first request on it: re-handshake and resend rather than failing the query. A bind-time
+		// PREPARE depends on no server-side state, so replaying it is safe.
+		bind_response = bind_data->client_connection->RequestWithReconnect<PrepareResponseMessage>(
+		    context, [&](const string &connection_id) {
+			    return make_uniq<PrepareRequestMessage>(connection_id, query, bind_data->query_uuid,
+			                                            /*prepare_only=*/!eager);
+		    });
+	}
 	CaptureBindResponse(*bind_data, *bind_response, query, eager, return_types, names);
 	if (refresh_catalog) {
 		// the query was a statement pushed down by the RemotePushdownOptimizer - the server has already
@@ -388,11 +399,19 @@ unique_ptr<GlobalTableFunctionState> QuackScanInitGlobal(ClientContext &context,
 		}
 		auto &client_connection = *bind_data.client_connection;
 		query_uuid = UUID::GenerateRandomUUID();
-		// A fresh PREPARE depends on no server-side state, so it can re-handshake and resend.
-		auto response_message = client_connection.RequestWithReconnect<PrepareResponseMessage>(
-		    context, [&](const string &connection_id) {
-			    return make_uniq<PrepareRequestMessage>(connection_id, query, query_uuid);
-		    });
+		unique_ptr<PrepareResponseMessage> response_message;
+		if (bind_data.use_transaction) {
+			// inside the remote transaction: run on its session, or fail with it
+			auto client_wrapper = client_connection.GetClient(context);
+			response_message = client_wrapper->GetClient().Request<PrepareResponseMessage>(
+			    context, make_uniq<PrepareRequestMessage>(client_connection.ConnectionId(), query, query_uuid));
+		} else {
+			// A fresh PREPARE depends on no server-side state, so it can re-handshake and resend.
+			response_message = client_connection.RequestWithReconnect<PrepareResponseMessage>(
+			    context, [&](const string &connection_id) {
+				    return make_uniq<PrepareRequestMessage>(connection_id, query, query_uuid);
+			    });
+		}
 		// The scan consumes chunks positionally, so a server-side schema drift must fail loudly
 		// instead of mapping the wrong columns.
 		vector<LogicalType> expected_types;

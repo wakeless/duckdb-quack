@@ -22,6 +22,7 @@ struct QuackScanBindData : FunctionData {
 		result->remote_query = remote_query;
 		result->remote_filters = remote_filters;
 		result->remote_query_rewritten = remote_query_rewritten;
+		result->use_transaction = use_transaction;
 		result->estimated_cardinality = estimated_cardinality;
 		result->column_names = column_names;
 		result->column_types = column_types;
@@ -48,6 +49,10 @@ struct QuackScanBindData : FunctionData {
 	//! Whether remote_query was rewritten by an absorbed aggregate or join. Shown in EXPLAIN;
 	//! the raw bind-time query of an untouched scan is not.
 	bool remote_query_rewritten = false;
+	//! Whether the scan runs inside the catalog's remote transaction (use_transaction). Its PREPAREs
+	//! must then not re-handshake: a fresh session would run the statement outside the transaction
+	//! the server dropped, and apply it while the COMMIT still fails.
+	bool use_transaction = false;
 	//! Row estimate the server reported for this query; 0 when it reported none
 	idx_t estimated_cardinality = 0;
 	hugeint_t query_uuid;

@@ -1,0 +1,95 @@
+# name: test/sql/session_recovery_transaction.test
+# description: a session lost mid-transaction fails the transaction instead of half-applying it
+# group: [sql]
+
+include test/template/quack_setup.test_template
+
+statement ok quack_db:quack_server_con
+create table t1 as select range i from range(10);
+
+statement ok con2
+create secret (type quack, token 'asdf')
+
+statement ok con2
+attach {server} as remote
+
+query I con2
+select count(*) from remote.main.t1;
+----
+10
+
+# ---------------------------------------------------------------------------
+# Session lost after the remote BEGIN: every later statement belongs to a transaction the server
+# no longer has, so it must fail rather than re-handshake and apply outside it.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+begin transaction;
+
+statement ok con2
+create table remote.main.t2(i int);
+
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement error con2
+create table remote.main.t3(i int);
+----
+Invalid connection id
+
+# A rollback of a transaction the server already dropped is a no-op, not an error: throwing here
+# would escalate into a fatal error and poison the connection.
+statement ok con2
+rollback;
+
+query I quack_db:quack_server_con
+select count(*) from duckdb_tables() where table_name in ('t2', 't3');
+----
+0
+
+# ---------------------------------------------------------------------------
+# Same loss, but the client commits instead of rolling back. The work is gone, so the commit must
+# fail loudly - silently reporting success would lose writes.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+begin transaction;
+
+statement ok con2
+create table remote.main.t4(i int);
+
+statement ok quack_db:quack_server_con
+select * from quack_stop(getvariable('actual_listen_uri'));
+
+statement ok quack_db:quack_server_con
+select * from quack_serve(getvariable('actual_listen_uri'), token='asdf');
+
+statement error con2
+commit;
+----
+Invalid connection id
+
+query I quack_db:quack_server_con
+select count(*) from duckdb_tables() where table_name = 't4';
+----
+0
+
+# ---------------------------------------------------------------------------
+# The attachment is still usable afterwards: a fresh statement re-handshakes at its own BEGIN.
+# ---------------------------------------------------------------------------
+
+statement ok con2
+create table remote.main.t5(i int);
+
+query I quack_db:quack_server_con
+select count(*) from duckdb_tables() where table_name = 't5';
+----
+1
+
+statement ok con2
+detach remote;
+
+include test/template/quack_teardown.test_template
